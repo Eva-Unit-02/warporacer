@@ -3,18 +3,25 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
+import torch
 import warp as wp
 from cv2 import IMREAD_GRAYSCALE, imread
+from rsl_rl.runners import OnPolicyRunner
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
+from tensordict import TensorDict
 from typer import run
 from yaml import safe_load
 
 OCC_THRESH = 230
 SMOOTH_WINDOW = 51
 LIDAR_RANGE = 20.0
+NUM_LIDAR = 108
+LIDAR_FOV = np.radians(270.0)
+OBS_DIM = 3 + NUM_LIDAR
+ACT_DIM = 2
 MAX_STEPS = 10000
 ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 
@@ -64,8 +71,7 @@ def vehicle_dynamics_st(
     state = VehicleD()
     state.d_delta = steer_v
     state.d_v = acceleration
-    # kenematic model
-    if wp.abs(car_v) < 0.1:
+    if wp.abs(car_v) < 0.5:
         beta = wp.atan(wp.tan(car_delta) * LENGTH_REAR / LENGTH_WHEELBASE)
         state.d_x = car_v * wp.cos(beta + car_psi)
         state.d_y = car_v * wp.sin(beta + car_psi)
@@ -73,7 +79,7 @@ def vehicle_dynamics_st(
         state.d_beta = (LENGTH_REAR * steer_v) / (
             LENGTH_WHEELBASE
             * wp.cos(car_delta) ** 2.0
-            * (1.0 + (wp.tan(car_delta) ** 2.0 * LENGTH_REAR / LENGTH_WHEELBASE) ** 2.0)
+            * (1.0 + (wp.tan(car_delta) * LENGTH_REAR / LENGTH_WHEELBASE) ** 2.0)
         )
         state.dd_psi = (
             1.0
@@ -84,12 +90,11 @@ def vehicle_dynamics_st(
                 + car_v * wp.cos(car_beta) * steer_v / wp.cos(car_delta) ** 2.0
             )
         )
-    # dynamic model
     else:
         state.d_x = car_v * wp.cos(car_beta + car_psi)
         state.d_y = car_v * wp.sin(car_beta + car_psi)
-        state.d_delta = steer_v
-        state.d_beta = (
+        state.d_psi = car_psi_prime
+        state.dd_psi = (
             -MU
             * MASS
             / (car_v * INERTIA * LENGTH_WHEELBASE)
@@ -122,7 +127,7 @@ def vehicle_dynamics_st(
             * (G * LENGTH_REAR - acceleration * CG_HEIGHT)
             * car_delta
         )
-        state.dd_psi = (
+        state.d_beta = (
             (
                 MU
                 / (car_v**2.0 * LENGTH_WHEELBASE)
@@ -218,7 +223,6 @@ def step(
         steer_v,
         acceleration,
     )
-
     k4 = vehicle_dynamics_st(
         car_delta + k3.d_delta * DT,
         car_v + k3.d_v * DT,
@@ -240,6 +244,10 @@ def step(
         (k1.dd_psi + 2.0 * k2.dd_psi + 2.0 * k3.dd_psi + k4.dd_psi) * DT / 6.0
     )
     car_beta += (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT / 6.0
+
+    car_delta = wp.clamp(car_delta, STEER_MIN, STEER_MAX)
+    car_v = wp.clamp(car_v, V_MIN, V_MAX)
+
     car_px = wp.clamp(wp.int32((car_x - origin_x) / res), 0, map_w - 1)
     car_py = wp.clamp(
         wp.int32(float(map_h) - 1.0 - (car_y - origin_y) / res), 0, map_h - 1
@@ -247,14 +255,12 @@ def step(
 
     car_pos_px = wp.vec2(wp.float32(car_px), wp.float32(car_py))
 
-    # collision logic
     term = distance_transform_px[car_px, car_py] * res < wp.length(
         wp.vec2(WIDTH / 2.0, LENGTH / 2.0)
     )
     trunc = car_steps >= MAX_STEPS
     car_steps += 1
 
-    # reward logic
     new_car_waypoint = centerline_lut[car_px, car_py]
     d_centerline_pt = new_car_waypoint - car_waypoint
     if d_centerline_pt > num_centerline_pts / 2:
@@ -284,7 +290,6 @@ def step(
         )
         car_pos_px = wp.vec2(wp.float32(car_px), wp.float32(car_py))
 
-    # raycast
     sh, ch = wp.sin(car_psi), wp.cos(car_psi)
     for j in range(lidar_dirs.shape[0]):
         ray = wp.vec2(wp.float32(car_px), wp.float32(car_py))
@@ -300,7 +305,7 @@ def step(
             ray += d_px * dt_ray
             if dt_ray == 0.0:
                 break
-        observation[i, j + 3] = wp.length(ray - car_pos_px) * res
+        observation[i, j + 3] = wp.min(wp.length(ray - car_pos_px) * res, LIDAR_RANGE)
 
     cars[i, 0] = car_x
     cars[i, 1] = car_y
@@ -391,188 +396,170 @@ class Map:
         )[1].reshape(rows.shape)
 
 
-def main(
-    yaml_path: Path,
-    num_cars: int = 4,
-    num_steps: int = 2000,
-    substeps: int = 4,
-    seed: int = 0,
-):
-    """
-    Debugging driver. Spawns `num_cars` cars at random centerline points, drives
-    them with a gentle throttle + noisy steer, and streams everything to rerun.
+class RacingEnv:
+    def __init__(
+        self, map_path: Path, num_envs: int, seed: int = 0, device: str | None = None
+    ):
+        wp.init()
+        self.num_envs = num_envs
+        self.num_obs = OBS_DIM
+        self.num_actions = ACT_DIM
+        self.num_privileged_obs = None
+        self.max_episode_length = MAX_STEPS
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.cfg = {}
 
-    Logged per step:
-      map/car_k/pos       — car position
-      map/car_k/heading   — short white line showing psi
-      map/car_k/lidar     — 108 lidar rays
-      telem/car_k/{v, delta, psi_dot, beta, reward, steps}
-    """
-    import rerun as rr
+        self.map = Map(map_path)
+        d = self.device
 
-    wp.init()
-    rr.init("warporacer")
-    rr.spawn()
+        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
+        self.lut_buf = wp.array(
+            self.map.centerline_lut.T.astype(np.int32), dtype=int, device=d
+        )
+        self.centerline_buf = wp.array(
+            np.column_stack([self.map.centerline, self.map.angles]).astype(np.float32),
+            dtype=wp.vec3,
+            device=d,
+        )
+        self.num_centerline = len(self.map.centerline)
 
-    rng = np.random.default_rng(seed)
-    m = Map(yaml_path)
+        rng = np.random.default_rng(seed)
+        idxs = rng.integers(0, self.num_centerline, size=num_envs)
+        cars = np.zeros((num_envs, 7), dtype=np.float32)
+        cars[:, 0] = self.map.centerline[idxs, 0]
+        cars[:, 1] = self.map.centerline[idxs, 1]
+        cars[:, 4] = self.map.angles[idxs]
+        cars_int = np.zeros((num_envs, 2), dtype=np.int32)
+        cars_int[:, 1] = idxs
 
-    # static layers
-    rr.log("map", rr.Image(m.raw), static=True)
-    rr.log(
-        "map/dt",
-        rr.Image((m.dt / max(m.dt.max(), 1.0) * 255).astype(np.uint8)),
-        static=True,
-    )
-    centerline_px_disp = np.column_stack(
-        [
-            (m.centerline[:, 0] - m.ox) / m.res,
-            m.h - 1 - (m.centerline[:, 1] - m.oy) / m.res,
-        ]
-    )
-    rr.log(
-        "map/centerline",
-        rr.Points2D(centerline_px_disp, colors=[(0, 120, 255)], radii=0.4),
-        static=True,
-    )
+        self.cars = wp.array(cars, dtype=float, device=d)
+        self.cars_int = wp.array(cars_int, dtype=int, device=d)
+        self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
+        self.rew = wp.zeros(num_envs, dtype=float, device=d)
 
-    # lidar beams: 108 rays over ±135°, matches observation layout
-    num_lidar = 108
-    lidar_angles = np.linspace(-np.radians(135), np.radians(135), num_lidar).astype(
-        np.float32
-    )
-    lidar_dirs_np = np.column_stack(
-        [np.cos(lidar_angles), np.sin(lidar_angles)]
-    ).astype(np.float32)
+        self.obs_buf = wp.to_torch(self.obs)
+        self.rew_buf = wp.to_torch(self.rew)
+        self._cars_buf = wp.to_torch(self.cars)
+        self._step_counter = wp.to_torch(self.cars_int)[:, 0]
 
-    # warp map buffers (transposed because kernel indexes [x, y] not [row, col])
-    dt_wp = wp.array(m.dt.T.astype(np.float32), dtype=float)
-    lut_wp = wp.array(m.centerline_lut.T.astype(np.int32), dtype=int)
-    cl_wp = wp.array(
-        np.column_stack([m.centerline, m.angles]).astype(np.float32), dtype=wp.vec3
-    )
-    lidar_wp = wp.array(lidar_dirs_np, dtype=wp.vec2)
-    n_cl = len(m.centerline)
+        angles = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR).astype(
+            np.float32
+        )
+        self.lidar_buf = wp.array(
+            np.column_stack([np.cos(angles), np.sin(angles)]),
+            dtype=wp.vec2,
+            device=d,
+        )
 
-    # spawn cars at random centerline points
-    spawn_idxs = rng.integers(0, n_cl, size=num_cars)
-    cars_np = np.zeros((num_cars, 7), dtype=np.float32)
-    cars_int_np = np.zeros((num_cars, 2), dtype=np.int32)
-    for k, idx in enumerate(spawn_idxs):
-        cars_np[k] = [
-            m.centerline[idx, 0],
-            m.centerline[idx, 1],
-            0.0,
-            0.0,
-            m.angles[idx],
-            0.0,
-            0.0,
-        ]
-        cars_int_np[k, 0] = 0
-        cars_int_np[k, 1] = int(idx)
+        self._launch(wp.zeros(num_envs, dtype=wp.vec2, device=d))
+        self._sanitize()
 
-    cars_wp = wp.array(cars_np, dtype=float)
-    cars_int_wp = wp.array(cars_int_np, dtype=int)
-    obs_wp = wp.zeros((num_cars, 3 + num_lidar), dtype=float)
-    rew_wp = wp.zeros(num_cars, dtype=float)
-
-    # sanity: warn if any spawn starts inside the collision skin
-    collision_radius = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
-    for k, idx in enumerate(spawn_idxs):
-        wx, wy = m.centerline[idx, 0], m.centerline[idx, 1]
-        ix = int(np.clip((wx - m.ox) / m.res, 0, m.w - 1))
-        iy = int(np.clip(m.h - 1 - (wy - m.oy) / m.res, 0, m.h - 1))
-        clearance = m.dt[iy, ix] * m.res
-        if clearance < collision_radius:
-            print(
-                f"WARN car_{k} spawn idx={idx} clearance={clearance:.3f}m "
-                f"< collision_radius={collision_radius:.3f}m — will reset immediately"
-            )
-
-    car_colors = [
-        (255, 64, 64),
-        (64, 255, 255),
-        (255, 255, 64),
-        (255, 128, 255),
-        (128, 255, 128),
-        (255, 160, 64),
-    ]
-
-    for t in range(num_steps):
-        # gentle wandering driver
-        act_np = np.zeros((num_cars, 2), dtype=np.float32)
-        act_np[:, 0] = rng.uniform(-0.25, 0.25, size=num_cars)
-        act_np[:, 1] = 0.4
-        act_wp = wp.array(act_np, dtype=wp.vec2)
-
-        for _ in range(substeps):
-            wp.launch(
-                step,
-                dim=num_cars,
-                inputs=[
-                    act_wp,
-                    obs_wp,
-                    rew_wp,
-                    cars_wp,
-                    cars_int_wp,
-                    wp.vec2(m.ox, m.oy),
-                    m.res,
-                    dt_wp,
-                    lut_wp,
-                    cl_wp,
-                    n_cl,
-                    lidar_wp,
-                ],
-            )
+    def _launch(self, act):
+        wp.launch(
+            step,
+            dim=self.num_envs,
+            inputs=[
+                act,
+                self.obs,
+                self.rew,
+                self.cars,
+                self.cars_int,
+                wp.vec2(self.map.ox, self.map.oy),
+                self.map.res,
+                self.dt_buf,
+                self.lut_buf,
+                self.centerline_buf,
+                self.num_centerline,
+                self.lidar_buf,
+            ],
+        )
         wp.synchronize()
 
-        cars_out = cars_wp.numpy()
-        obs_out = obs_wp.numpy()
-        rew_out = rew_wp.numpy()
-        steps_out = cars_int_wp.numpy()[:, 0]
+    def _sanitize(self):
+        nan_mask = torch.isnan(self._cars_buf).any(dim=1) | torch.isinf(
+            self._cars_buf
+        ).any(dim=1)
+        torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
+        torch.nan_to_num_(self._cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
+        if nan_mask.any():
+            self._step_counter[nan_mask] = MAX_STEPS
 
-        rr.set_time("step", sequence=t)
+    def _td(self):
+        return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
 
-        for k in range(num_cars):
-            c = cars_out[k]
-            o = obs_out[k]
-            px = (c[0] - m.ox) / m.res
-            py = m.h - 1 - (c[1] - m.oy) / m.res
-            psi = c[4]
-            sh, ch = np.sin(psi), np.cos(psi)
+    def get_observations(self):
+        return self._td()
 
-            # lidar ends: obs is in meters, convert to pixels for overlay
-            dists_m = o[3 : 3 + num_lidar]
-            dists_px = dists_m / m.res
-            dx = ch * lidar_dirs_np[:, 0] - sh * lidar_dirs_np[:, 1]
-            dy = -(sh * lidar_dirs_np[:, 0] + ch * lidar_dirs_np[:, 1])
-            ends = np.column_stack([px + dx * dists_px, py + dy * dists_px])
-            starts = np.broadcast_to([px, py], ends.shape)
-            strips = np.stack([starts, ends], axis=1)
+    def reset(self):
+        return self._td()
 
-            color = car_colors[k % len(car_colors)]
-            rr.log(
-                f"map/car_{k}/pos",
-                rr.Points2D([[px, py]], radii=4.0, colors=[color]),
-            )
-            rr.log(
-                f"map/car_{k}/heading",
-                rr.LineStrips2D(
-                    [[[px, py], [px + ch * 12.0, py - sh * 12.0]]],
-                    colors=[(255, 255, 255)],
-                ),
-            )
-            rr.log(
-                f"map/car_{k}/lidar",
-                rr.LineStrips2D(strips, colors=[color + (70,)]),
-            )
+    def step(self, actions):
+        self._launch(wp.from_torch(actions.detach().contiguous(), dtype=wp.vec2))
+        self._sanitize()
+        dones = self._step_counter == 0
+        return self._td(), self.rew_buf, dones, {"time_outs": torch.zeros_like(dones)}
 
-            rr.log(f"telem/car_{k}/v", rr.Scalars(float(c[3])))
-            rr.log(f"telem/car_{k}/delta", rr.Scalars(float(c[2])))
-            rr.log(f"telem/car_{k}/psi_dot", rr.Scalars(float(c[5])))
-            rr.log(f"telem/car_{k}/beta", rr.Scalars(float(c[6])))
-            rr.log(f"telem/car_{k}/reward", rr.Scalars(float(rew_out[k])))
-            rr.log(f"telem/car_{k}/steps", rr.Scalars(float(steps_out[k])))
+
+def build_cfg(iterations: int, seed: int) -> dict:
+    mlp = {
+        "class_name": "MLPModel",
+        "hidden_dims": [256, 128, 64],
+        "activation": "elu",
+        "obs_normalization": True,
+    }
+    return {
+        "seed": seed,
+        "num_steps_per_env": 24,
+        "max_iterations": iterations,
+        "save_interval": 100,
+        "experiment_name": "warporacer",
+        "run_name": "",
+        "logger": "tensorboard",
+        "empirical_normalization": False,
+        "clip_actions": 1.0,
+        "obs_groups": {"policy": ["policy"], "critic": ["policy"]},
+        "actor": {
+            **mlp,
+            "distribution_cfg": {
+                "class_name": "GaussianDistribution",
+                "init_std": 1.0,
+                "std_type": "log",
+            },
+        },
+        "critic": {**mlp, "distribution_cfg": None},
+        "algorithm": {
+            "class_name": "PPO",
+            "num_learning_epochs": 5,
+            "num_mini_batches": 4,
+            "learning_rate": 1e-3,
+            "schedule": "adaptive",
+            "gamma": 0.99,
+            "lam": 0.95,
+            "entropy_coef": 0.005,
+            "desired_kl": 0.01,
+            "max_grad_norm": 1.0,
+            "clip_param": 0.2,
+            "use_clipped_value_loss": True,
+            "value_loss_coef": 1.0,
+            "rnd_cfg": None,
+            "symmetry_cfg": None,
+        },
+    }
+
+
+def main(
+    map_yaml: Path,
+    num_envs: int = 4096,
+    iterations: int = 2000,
+    seed: int = 0,
+    log_dir: Path = Path("./logs"),
+    device: str = "",
+):
+    env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
+    cfg = build_cfg(iterations, seed)
+    runner = OnPolicyRunner(env, cfg, log_dir=str(log_dir), device=env.device)
+    runner.learn(num_learning_iterations=iterations)
 
 
 if __name__ == "__main__":
