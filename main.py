@@ -285,9 +285,9 @@ def step_kernel(
 
     new_car_waypoint = centerline_lut[car_px, car_py]
     d_centerline_pt = new_car_waypoint - car_waypoint
-    if d_centerline_pt > num_centerline_pts / 2:
+    if 2 * d_centerline_pt > num_centerline_pts:
         d_centerline_pt -= num_centerline_pts
-    elif d_centerline_pt < -num_centerline_pts / 2:
+    elif 2 * d_centerline_pt < -num_centerline_pts:
         d_centerline_pt += num_centerline_pts
     reward[i] = wp.float32(d_centerline_pt) / wp.float32(
         num_centerline_pts
@@ -301,8 +301,12 @@ def step_kernel(
         done[i] = 0
 
     if trunc or term:
-        seed = i * 2654435761 + new_car_waypoint * 2246822519 + car_steps * 3266489917
-        random_number = wp.int32(wp.uint32(seed) >> wp.uint32(16)) % num_centerline_pts
+        seed = (
+            wp.uint32(i) * wp.uint32(2654435761)
+            + wp.uint32(new_car_waypoint) * wp.uint32(2246822519)
+            + wp.uint32(car_steps) * wp.uint32(3266489917)
+        )
+        random_number = wp.int32(seed >> wp.uint32(16)) % num_centerline_pts
         car_x = centerline[random_number][0]
         car_y = centerline[random_number][1]
         car_delta = 0.0
@@ -432,7 +436,7 @@ class Map:
 
 
 class RacingEnv:
-    observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
+    observation_space = gym.spaces.Box(OBS_LOW, OBS_HIGH, dtype=np.float32)
     action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
 
     def __init__(
@@ -490,6 +494,9 @@ class RacingEnv:
         self.nan_events = 0
         self._launch(wp.zeros(num_envs, dtype=wp.vec2, device=d))
         self._sanitize()
+        self._step_counter.zero_()
+        self.rew_buf.zero_()
+        self.done_buf.zero_()
 
     def _launch(self, act):
         wp.launch(
@@ -511,7 +518,7 @@ class RacingEnv:
                 self.lidar_buf,
             ],
         )
-        wp.synchronize()
+        wp.synchronize_device(self.cars.device)
 
     def _sanitize(self):
         bad = (
@@ -523,12 +530,19 @@ class RacingEnv:
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self._cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
-        if bad.any():
-            self.nan_events += int(bad.sum().item())
+        n_bad = int(bad.sum().item())
+        if n_bad:
+            self.nan_events += n_bad
             self._step_counter[bad] = MAX_STEPS
             self.done_buf[bad] = DONE_TRUNCATED
 
     def reset(self):
+        self._step_counter.fill_(MAX_STEPS)
+        self._launch(wp.zeros(self.num_envs, dtype=wp.vec2, device=self.cars.device))
+        self._sanitize()
+        self._step_counter.zero_()
+        self.rew_buf.zero_()
+        self.done_buf.zero_()
         return self.obs_buf, {}
 
     def step(self, actions):
@@ -709,17 +723,21 @@ def record_rollout(
 
 def _wandb_log(metrics: dict, step: int, video_path: Path | None = None) -> None:
     try:
-        import wandb
+        from wandb.errors import Error as WandbError
 
-        if wandb.run is None:
-            return
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is None:
+        return
+    try:
         if video_path is not None:
             metrics = {
                 **metrics,
                 "rollout": wandb.Video(str(video_path), format="mp4"),
             }
         wandb.log(metrics, step=step)
-    except Exception as exc:
+    except WandbError as exc:
         print(f"[warporacer] wandb log failed: {exc}")
 
 
@@ -753,6 +771,7 @@ def train(
     logp_buf = torch.zeros((rollouts, num_envs), device=device)
     rew_buf = torch.zeros((rollouts, num_envs), device=device)
     done_buf = torch.zeros((rollouts, num_envs), device=device)
+    term_buf = torch.zeros((rollouts, num_envs), device=device)
     val_buf = torch.zeros((rollouts, num_envs), device=device)
     ep_ret_buf = torch.zeros((rollouts, num_envs), device=device)
     ep_len_buf = torch.zeros((rollouts, num_envs), device=device)
@@ -781,6 +800,7 @@ def train(
             done = (term | trunc).float()
             rew_buf[t] = reward
             done_buf[t] = done
+            term_buf[t] = term.float()
             ep_returns += reward
             ep_steps += 1
             ep_ret_buf[t] = ep_returns
@@ -797,9 +817,10 @@ def train(
             last_gae = torch.zeros_like(next_value)
             for t in reversed(range(rollouts)):
                 next_v = val_buf[t + 1] if t < rollouts - 1 else next_value
-                nonterm = 1.0 - done_buf[t]
+                nonterm = 1.0 - term_buf[t]
+                nondone = 1.0 - done_buf[t]
                 delta = rew_buf[t] + gamma * next_v * nonterm - val_buf[t]
-                last_gae = delta + gamma * gae_lambda * nonterm * last_gae
+                last_gae = delta + gamma * gae_lambda * nondone * last_gae
                 adv_buf[t] = last_gae
             ret_buf = adv_buf + val_buf
 
@@ -818,7 +839,11 @@ def train(
         mb_size = batch_size // mini_batches
 
         agent.train()
-        kl_acc = clipfrac_acc = pg_acc = v_acc = ent_acc = 0.0
+        kl_t = torch.zeros((), device=device)
+        clipfrac_t = torch.zeros((), device=device)
+        pg_t = torch.zeros((), device=device)
+        v_t = torch.zeros((), device=device)
+        ent_t = torch.zeros((), device=device)
         n_updates = 0
 
         for epoch in range(learning_epochs):
@@ -832,8 +857,8 @@ def train(
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - logratio).mean()
                     clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
-                kl_acc += approx_kl.item()
-                clipfrac_acc += clipfrac.item()
+                kl_t += approx_kl
+                clipfrac_t += clipfrac
 
                 mb_adv = b_adv[mb]
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
@@ -865,12 +890,14 @@ def train(
                 nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
                 optimizer.step()
 
-                pg_acc += pg_loss.item()
-                v_acc += v_loss.item()
-                ent_acc += ent.item()
+                pg_t += pg_loss.detach()
+                v_t += v_loss.detach()
+                ent_t += ent.detach()
                 n_updates += 1
 
-        mean_kl = kl_acc / n_updates
+        mean_kl, mean_clipfrac, mean_pg, mean_v, mean_ent = (
+            torch.stack([kl_t, clipfrac_t, pg_t, v_t, ent_t]) / n_updates
+        ).tolist()
         scheduler.step(mean_kl)
 
         now = time.time()
@@ -878,11 +905,11 @@ def train(
         last_t = now
 
         metrics = {
-            "losses/policy_loss": pg_acc / n_updates,
-            "losses/value_loss": v_acc / n_updates,
-            "losses/entropy": ent_acc / n_updates,
+            "losses/policy_loss": mean_pg,
+            "losses/value_loss": mean_v,
+            "losses/entropy": mean_ent,
             "losses/approx_kl": mean_kl,
-            "losses/clipfrac": clipfrac_acc / n_updates,
+            "losses/clipfrac": mean_clipfrac,
             "policy/std": agent.actor_logstd.exp().mean().item(),
             "charts/learning_rate": scheduler.lr,
             "charts/sps": sps,
