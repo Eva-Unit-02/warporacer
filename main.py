@@ -29,7 +29,6 @@ MASS = 3.74
 INERTIA = 0.04712
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
-STEER_V_MIN = -3.2
 STEER_V_MAX = 3.2
 V_SWITCH = 7.319
 A_MAX = 9.51
@@ -73,16 +72,16 @@ def vehicle_dynamics_st(
         state.d_psi = car_v * wp.cos(beta) * wp.tan(car_delta) / LENGTH_WHEELBASE
         state.d_beta = (LENGTH_REAR * steer_v) / (
             LENGTH_WHEELBASE
-            * wp.cos(car_delta) ** 2
-            * (1 + (wp.tan(car_delta) ** 2 * LENGTH_REAR / LENGTH_WHEELBASE) ** 2)
+            * wp.cos(car_delta) ** 2.0
+            * (1.0 + (wp.tan(car_delta) ** 2.0 * LENGTH_REAR / LENGTH_WHEELBASE) ** 2.0)
         )
         state.dd_psi = (
-            1
+            1.0
             / LENGTH_WHEELBASE
             * (
                 acceleration * wp.cos(car_beta) * wp.tan(car_delta)
                 - car_v * wp.sin(car_beta) * state.d_beta * wp.tan(car_delta)
-                + car_v * wp.cos(car_beta) * steer_v / wp.cos(car_delta) ** 2
+                + car_v * wp.cos(car_beta) * steer_v / wp.cos(car_delta) ** 2.0
             )
         )
     # dynamic model
@@ -95,10 +94,10 @@ def vehicle_dynamics_st(
             * MASS
             / (car_v * INERTIA * LENGTH_WHEELBASE)
             * (
-                LENGTH_FRONT**2
+                LENGTH_FRONT**2.0
                 * FRONT_CORNERING_STIFFNESS
                 * (G * LENGTH_REAR - acceleration * CG_HEIGHT)
-                + LENGTH_REAR**2
+                + LENGTH_REAR**2.0
                 * REAR_CORNERING_STIFFNESS
                 * (G * LENGTH_FRONT + acceleration * CG_HEIGHT)
             )
@@ -126,7 +125,7 @@ def vehicle_dynamics_st(
         state.dd_psi = (
             (
                 MU
-                / (car_v**2 * LENGTH_WHEELBASE)
+                / (car_v**2.0 * LENGTH_WHEELBASE)
                 * (
                     REAR_CORNERING_STIFFNESS
                     * (G * LENGTH_FRONT + acceleration * CG_HEIGHT)
@@ -135,7 +134,7 @@ def vehicle_dynamics_st(
                     * (G * LENGTH_REAR - acceleration * CG_HEIGHT)
                     * LENGTH_FRONT
                 )
-                - 1
+                - 1.0
             )
             * car_psi_prime
             - MU
@@ -163,7 +162,7 @@ def step(
     origin: wp.vec2,
     res: float,
     distance_transform_px: wp.array2d[float],
-    centerline_lut: wp.array2d[float],
+    centerline_lut: wp.array2d[int],
     centerline: wp.array[wp.vec3],
     num_centerline_pts: int,
     lidar_dirs: wp.array[wp.vec2],
@@ -178,24 +177,22 @@ def step(
     car_psi_prime = cars[i, 5]
     car_beta = cars[i, 6]
     car_step = cars[i, 7]
-    car_centerline_pt = cars[i, 8]
+    car_centerline_pt = wp.int32(cars[i, 8])
 
     origin_x = origin[0]
     origin_y = origin[1]
 
-    # width_px = dt_px.size[0]
-    height_px = distance_transform_px.size[1]
-
     car_px = (car_x - origin_x) / res
-    car_py = height_px - 1 - (car_y - origin_y) / res
+    car_py = float(distance_transform_px.shape[1]) - 1.0 - (car_y - origin_y) / res
+
     car_pos_px = wp.vec2(car_px, car_py)
 
-    steer_v = wp.clamp(actions[i, 0] * STEER_V_MAX, STEER_V_MIN, STEER_V_MAX)
+    steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if steer_v < 0 and car_delta <= STEER_MIN or steer_v > 0 and car_delta >= STEER_MAX:
-        steer_v = 0
-    acceleration = wp.clamp(actions[i, 1], -1, 1) * A_MAX
+        steer_v = 0.0
+    acceleration = wp.clamp(actions[i][1], -1.0, 1.0) * A_MAX
     if acceleration < 0 and car_v <= V_MIN or acceleration > 0 and car_v >= V_MAX:
-        acceleration = 0
+        acceleration = 0.0
 
     k1 = vehicle_dynamics_st(
         car_delta, car_v, car_psi, car_psi_prime, car_beta, steer_v, acceleration
@@ -243,43 +240,45 @@ def step(
     observation[i, 2] = cars[i, 5]
 
     # collision logic
-    term = distance_transform_px[car_px, car_py] * res < wp.length(
-        wp.vec2([WIDTH / 2, LENGTH / 2])
+    term = distance_transform_px[wp.int32(car_px), wp.int32(car_py)] * res < wp.length(
+        wp.vec2(WIDTH / 2.0, LENGTH / 2.0)
     )
     trunc = car_step >= MAX_STEPS
-    cars[i, 7] += 1
+    cars[i, 7] += 1.0
 
     # reward logic
-    new_centerline_pt = centerline_lut[car_px, car_py]
-    cars[i, 8] = new_centerline_pt
+    new_centerline_pt = centerline_lut[wp.int32(car_px), wp.int32(car_py)]
+    cars[i, 8] = wp.float(new_centerline_pt)
     d_centerline_pt = new_centerline_pt - car_centerline_pt
     if d_centerline_pt > num_centerline_pts / 2:
         d_centerline_pt -= num_centerline_pts
     elif d_centerline_pt < -num_centerline_pts / 2:
         d_centerline_pt += num_centerline_pts
-    reward[i] = d_centerline_pt / num_centerline_pts - term
+    reward[i] = wp.float32(d_centerline_pt) / wp.float32(
+        num_centerline_pts
+    ) - wp.float32(term)
 
     # reset logic
     if trunc or term:
         random_number = (
             wp.int32(wp.uint32(i * 2654435761) >> wp.uint32(16)) % num_centerline_pts
         )
-        cars[i, 0] = centerline[random_number, 0]
-        cars[i, 1] = centerline[random_number, 1]
+        cars[i, 0] = centerline[random_number][0]
+        cars[i, 1] = centerline[random_number][1]
         cars[i, 2] = 0.0
         cars[i, 3] = 0.0
-        cars[i, 4] = centerline[random_number, 2]
+        cars[i, 4] = centerline[random_number][2]
         cars[i, 5] = 0.0
         cars[i, 6] = 0.0
         cars[i, 7] = 0.0
-        cars[i, 8] = random_number
+        cars[i, 8] = wp.float32(random_number)
 
     # raycast
     ray = wp.vec2(car_px, car_py)
     sh, ch = wp.sin(car_psi), wp.cos(car_psi)
     for j in range(len(lidar_dirs)):
-        ca = lidar_dirs[j, 0]
-        sa = lidar_dirs[j, 1]
+        ca = lidar_dirs[j][0]
+        sa = lidar_dirs[j][1]
         d_px = wp.vec2(ch * ca - sh * sa, sh * ca + ch * sa)
         while wp.length(ray - car_pos_px) < LIDAR_RANGE:
             ray_px = wp.int32(ray[0])
@@ -386,6 +385,61 @@ class Map:
 
 def main(yaml_path: Path):
     map = Map(yaml_path)
+
+    try:
+        import rerun as rr
+
+        n = 1
+        lidar_angles = np.linspace(-np.pi, np.pi, 20)
+        lidar_dirs_np = np.column_stack(
+            [np.cos(lidar_angles), np.sin(lidar_angles)]
+        ).astype(np.float32)
+
+        start = map.centerline[0]
+        cars_np = np.zeros((n, 9), dtype=np.float32)
+        cars_np[0, :3] = [start[0], start[1], 0]
+        cars_np[0, 4] = map.angles[0]
+
+        dt_px = wp.array(map.dt.astype(np.float32), dtype=float)
+        lut = wp.array(map.centerline_lut.astype(np.float32), dtype=float)
+        cl = wp.array(
+            np.column_stack([map.centerline, map.angles]).astype(np.float32),
+            dtype=wp.vec3,
+        )
+        lidar_dirs = wp.array(lidar_dirs_np, dtype=wp.vec2)
+        cars = wp.array(cars_np, dtype=float)
+        actions = wp.zeros((n, 2), dtype=float)
+        obs = wp.zeros((n, 3 + len(lidar_angles)), dtype=float)
+        rew = wp.zeros(n, dtype=float)
+        origin = wp.vec2(float(map.ox), float(map.oy))
+
+        for _ in range(MAX_STEPS):
+            actions_np = np.random.uniform(-1, 1, (n, 2)).astype(np.float32)
+            actions = wp.array(actions_np, dtype=float)
+            wp.launch(
+                step,
+                dim=n,
+                inputs=[
+                    actions,
+                    obs,
+                    rew,
+                    cars,
+                    origin,
+                    map.res,
+                    dt_px,
+                    lut,
+                    cl,
+                    len(map.centerline),
+                    lidar_dirs,
+                ],
+            )
+            c = cars.numpy()
+            rr.log("car/pos", rr.Points2D([[c[0, 0], c[0, 1]]], radii=0.1))
+            rr.log("car/speed", rr.Scalar(c[0, 3]))
+            rr.log("car/reward", rr.Scalar(rew.numpy()[0]))
+
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":
