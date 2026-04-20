@@ -1,25 +1,26 @@
-# pyright: reportIndexIssue=false
+import time
 from collections import deque
 from pathlib import Path
 
 import gymnasium as gym
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn as nn
 import warp as wp
-from cv2 import IMREAD_GRAYSCALE, imread
+from cv2 import (
+    COLOR_GRAY2RGB,
+    IMREAD_GRAYSCALE,
+    cvtColor,
+    fillPoly,
+    imread,
+    polylines,
+)
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
-from skrl.agents.torch.ppo import PPO, PPO_CFG
-from skrl.envs.wrappers.torch import Wrapper
-from skrl.memories.torch import RandomMemory
-from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
-from skrl.resources.preprocessors.torch import RunningStandardScaler
-from skrl.resources.schedulers.torch import KLAdaptiveLR
-from skrl.trainers.torch import SequentialTrainer
-from skrl.utils import set_seed
+from torch.distributions import Normal
 from typer import run
 from yaml import safe_load
 
@@ -49,10 +50,21 @@ V_SWITCH = 7.319
 A_MAX = 9.51
 V_MIN = -5.0
 V_MAX = 20.0
+PSI_PRIME_MAX = 6.0
 WIDTH = 0.31
 LENGTH = 0.58
 G = 9.81
 DT = 1 / 60
+
+DONE_TERMINATED = 1
+DONE_TRUNCATED = 2
+
+OBS_LOW = np.concatenate(
+    [[STEER_MIN, V_MIN, -PSI_PRIME_MAX], np.zeros(NUM_LIDAR)]
+).astype(np.float32)
+OBS_HIGH = np.concatenate(
+    [[STEER_MAX, V_MAX, PSI_PRIME_MAX], np.full(NUM_LIDAR, LIDAR_RANGE)]
+).astype(np.float32)
 
 
 @wp.struct
@@ -79,7 +91,7 @@ def vehicle_dynamics_st(
     state = VehicleD()
     state.d_delta = steer_v
     state.d_v = acceleration
-    if wp.abs(car_v) < 0.5:
+    if wp.abs(car_v) < V_SWITCH:
         beta = wp.atan(wp.tan(car_delta) * LENGTH_REAR / LENGTH_WHEELBASE)
         state.d_x = car_v * wp.cos(beta + car_psi)
         state.d_y = car_v * wp.sin(beta + car_psi)
@@ -167,10 +179,11 @@ def vehicle_dynamics_st(
 
 
 @wp.kernel
-def step(
+def step_kernel(
     actions: wp.array[wp.vec2],
     observation: wp.array2d[float],
     reward: wp.array[float],
+    done: wp.array[int],
     cars: wp.array2d[float],
     cars_int: wp.array2d[int],
     origin: wp.vec2,
@@ -190,13 +203,11 @@ def step(
     car_psi = cars[i, 4]
     car_psi_prime = cars[i, 5]
     car_beta = cars[i, 6]
-
     car_steps = cars_int[i, 0]
     car_waypoint = cars_int[i, 1]
 
     origin_x = origin[0]
     origin_y = origin[1]
-
     map_w = distance_transform_px.shape[0]
     map_h = distance_transform_px.shape[1]
 
@@ -204,10 +215,12 @@ def step(
     acceleration_action = actions[i][1]
 
     steer_v = wp.clamp(steer_action, -1.0, 1.0) * STEER_V_MAX
-    if steer_v < 0 and car_delta <= STEER_MIN or steer_v > 0 and car_delta >= STEER_MAX:
+    if (steer_v < 0 and car_delta <= STEER_MIN) or (
+        steer_v > 0 and car_delta >= STEER_MAX
+    ):
         steer_v = 0.0
     acceleration = wp.clamp(acceleration_action, -1.0, 1.0) * A_MAX
-    if acceleration < 0 and car_v <= V_MIN or acceleration > 0 and car_v >= V_MAX:
+    if (acceleration < 0 and car_v <= V_MIN) or (acceleration > 0 and car_v >= V_MAX):
         acceleration = 0.0
 
     k1 = vehicle_dynamics_st(
@@ -255,12 +268,13 @@ def step(
 
     car_delta = wp.clamp(car_delta, STEER_MIN, STEER_MAX)
     car_v = wp.clamp(car_v, V_MIN, V_MAX)
+    car_psi_prime = wp.clamp(car_psi_prime, -PSI_PRIME_MAX, PSI_PRIME_MAX)
+    car_beta = wp.clamp(car_beta, -1.2, 1.2)
 
     car_px = wp.clamp(wp.int32((car_x - origin_x) / res), 0, map_w - 1)
     car_py = wp.clamp(
         wp.int32(float(map_h) - 1.0 - (car_y - origin_y) / res), 0, map_h - 1
     )
-
     car_pos_px = wp.vec2(wp.float32(car_px), wp.float32(car_py))
 
     term = distance_transform_px[car_px, car_py] * res < wp.length(
@@ -279,6 +293,13 @@ def step(
         num_centerline_pts
     ) - wp.float32(term)
 
+    if term:
+        done[i] = 1
+    elif trunc:
+        done[i] = 2
+    else:
+        done[i] = 0
+
     if trunc or term:
         seed = i * 2654435761 + new_car_waypoint * 2246822519 + car_steps * 3266489917
         random_number = wp.int32(wp.uint32(seed) >> wp.uint32(16)) % num_centerline_pts
@@ -291,7 +312,6 @@ def step(
         car_beta = 0.0
         car_steps = 0
         new_car_waypoint = random_number
-
         car_px = wp.clamp(wp.int32((car_x - origin_x) / res), 0, map_w - 1)
         car_py = wp.clamp(
             wp.int32(float(map_h) - 1.0 - (car_y - origin_y) / res), 0, map_h - 1
@@ -322,7 +342,6 @@ def step(
     cars[i, 4] = car_psi
     cars[i, 5] = car_psi_prime
     cars[i, 6] = car_beta
-
     cars_int[i, 0] = car_steps
     cars_int[i, 1] = new_car_waypoint
 
@@ -345,24 +364,36 @@ class Map:
         self._compute_centerline(self.raw)
         self._build_lut()
 
+    @staticmethod
+    def _neighbors(skeleton, r, c):
+        h, w = skeleton.shape
+        return [
+            (r + dr, c + dc)
+            for dr, dc in ADJ
+            if 0 <= r + dr < h and 0 <= c + dc < w and skeleton[r + dr, c + dc]
+        ]
+
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
         pts = np.argwhere(skeleton)
         origin_px = [self.h - 1 + self.oy / self.res, -self.ox / self.res]
-        start = tuple(pts[np.argmin(np.linalg.norm(pts - origin_px, axis=1))])
-        nbrs = [
-            (start[0] + dr, start[1] + dc)
-            for dr, dc in ADJ
-            if skeleton[start[0] + dr, start[1] + dc]
-        ]
+        start = tuple(
+            int(x) for x in pts[np.argmin(np.linalg.norm(pts - origin_px, axis=1))]
+        )
+        nbrs = self._neighbors(skeleton, *start)
+        if len(nbrs) < 2:
+            raise RuntimeError(
+                f"Skeleton seed {start} has {len(nbrs)} neighbors; need a closed loop."
+            )
         src, target = nbrs[0], nbrs[1]
+
         parent = {src: src}
         q = deque([src])
         while q:
             r, c = q.popleft()
-            for dr, dc in ADJ:
-                n = (r + dr, c + dc)
-                if skeleton[n] and n not in parent and n != start:
+            for nr, nc in self._neighbors(skeleton, r, c):
+                n = (nr, nc)
+                if n not in parent and n != start:
                     parent[n] = (r, c)
                     if n == target:
                         q.clear()
@@ -405,7 +436,11 @@ class RacingEnv:
     action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
 
     def __init__(
-        self, map_path: Path, num_envs: int, seed: int = 0, device: str | None = None
+        self,
+        map_path: Path,
+        num_envs: int,
+        seed: int = 0,
+        device: str | None = None,
     ):
         wp.init()
         self.num_envs = num_envs
@@ -437,9 +472,11 @@ class RacingEnv:
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
         self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
         self.rew = wp.zeros(num_envs, dtype=float, device=d)
+        self.done = wp.zeros(num_envs, dtype=int, device=d)
 
         self.obs_buf = wp.to_torch(self.obs)
         self.rew_buf = wp.to_torch(self.rew)
+        self.done_buf = wp.to_torch(self.done)
         self._cars_buf = wp.to_torch(self.cars)
         self._step_counter = wp.to_torch(self.cars_int)[:, 0]
 
@@ -450,17 +487,19 @@ class RacingEnv:
             device=d,
         )
 
+        self.nan_events = 0
         self._launch(wp.zeros(num_envs, dtype=wp.vec2, device=d))
         self._sanitize()
 
     def _launch(self, act):
         wp.launch(
-            step,
+            step_kernel,
             dim=self.num_envs,
             inputs=[
                 act,
                 self.obs,
                 self.rew,
+                self.done,
                 self.cars,
                 self.cars_int,
                 wp.vec2(self.map.ox, self.map.oy),
@@ -475,14 +514,19 @@ class RacingEnv:
         wp.synchronize()
 
     def _sanitize(self):
-        nan_mask = torch.isnan(self._cars_buf).any(dim=1) | torch.isinf(
-            self._cars_buf
-        ).any(dim=1)
+        bad = (
+            torch.isnan(self.obs_buf).any(dim=1)
+            | torch.isinf(self.obs_buf).any(dim=1)
+            | torch.isnan(self._cars_buf).any(dim=1)
+            | torch.isinf(self._cars_buf).any(dim=1)
+        )
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self._cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
-        if nan_mask.any():
-            self._step_counter[nan_mask] = MAX_STEPS
+        if bad.any():
+            self.nan_events += int(bad.sum().item())
+            self._step_counter[bad] = MAX_STEPS
+            self.done_buf[bad] = DONE_TRUNCATED
 
     def reset(self):
         return self.obs_buf, {}
@@ -490,113 +534,381 @@ class RacingEnv:
     def step(self, actions):
         self._launch(wp.from_torch(actions.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
-        terminated = (self._step_counter == 0).unsqueeze(-1)
-        truncated = torch.zeros_like(terminated)
-        return self.obs_buf, self.rew_buf.unsqueeze(-1), terminated, truncated, {}
+        terminated = self.done_buf == DONE_TERMINATED
+        truncated = self.done_buf == DONE_TRUNCATED
+        return self.obs_buf, self.rew_buf, terminated, truncated, {}
+
+    def save_state(self):
+        return {
+            "cars": self._cars_buf.clone(),
+            "cars_int": wp.to_torch(self.cars_int).clone(),
+            "obs": self.obs_buf.clone(),
+            "rew": self.rew_buf.clone(),
+            "done": self.done_buf.clone(),
+        }
+
+    def restore_state(self, s):
+        self._cars_buf.copy_(s["cars"])
+        wp.to_torch(self.cars_int).copy_(s["cars_int"])
+        self.obs_buf.copy_(s["obs"])
+        self.rew_buf.copy_(s["rew"])
+        self.done_buf.copy_(s["done"])
 
 
-class WarpEnvWrapper(Wrapper):
-    @property
-    def observation_space(self):
-        return self._env.observation_space
-
-    @property
-    def action_space(self):
-        return self._env.action_space
-
-    @property
-    def state_space(self):
-        return self._env.observation_space
-
-    @property
-    def num_envs(self):
-        return self._env.num_envs
-
-    @property
-    def num_agents(self):
-        return 1
-
-    @property
-    def device(self):
-        return torch.device(self._env.device)
-
-    def step(self, actions):
-        return self._env.step(actions)
-
-    def reset(self):
-        return self._env.reset()
-
-    def state(self):
-        return None
-
-    def render(self, *args, **kwargs):
-        return None
-
-    def close(self):
-        pass
+def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0)) -> nn.Linear:
+    nn.init.orthogonal_(layer.weight, std)
+    nn.init.zeros_(layer.bias)
+    return layer
 
 
-class ActorCritic(GaussianMixin, DeterministicMixin, Model):
+class Agent(nn.Module):
     def __init__(
         self,
-        observation_space,
-        state_space,
-        action_space,
-        device,
-        clip_actions=True,
-        clip_log_std=True,
-        min_log_std=-20,
-        max_log_std=2,
-        reduction="sum",
+        obs_dim: int = OBS_DIM,
+        act_dim: int = ACT_DIM,
+        obs_low: np.ndarray = OBS_LOW,
+        obs_high: np.ndarray = OBS_HIGH,
     ):
-        Model.__init__(
-            self,
-            observation_space=observation_space,
-            state_space=state_space,
-            action_space=action_space,
-            device=device,
-        )
-        GaussianMixin.__init__(
-            self,
-            clip_actions=clip_actions,
-            clip_log_std=clip_log_std,
-            min_log_std=min_log_std,
-            max_log_std=max_log_std,
-            reduction=reduction,
-        )
-        DeterministicMixin.__init__(self)
+        super().__init__()
+        mid = (obs_low + obs_high) * 0.5
+        half_range = (obs_high - obs_low) * 0.5
+        self.register_buffer("obs_mid", torch.from_numpy(mid))
+        self.register_buffer("obs_inv_scale", torch.from_numpy(1.0 / half_range))
 
         self.backbone = nn.Sequential(
-            nn.Linear(self.num_observations, 256),
+            layer_init(nn.Linear(obs_dim, 256)),
             nn.ELU(),
-            nn.Linear(256, 128),
+            layer_init(nn.Linear(256, 128)),
             nn.ELU(),
-            nn.Linear(128, 64),
+            layer_init(nn.Linear(128, 64)),
             nn.ELU(),
         )
-        self.policy_head = nn.Sequential(nn.Linear(64, self.num_actions), nn.Tanh())
-        self.value_head = nn.Linear(64, 1)
-        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
-        self._shared_output = None
+        self.actor_mean = layer_init(nn.Linear(64, act_dim), std=0.01)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
+        self.critic = layer_init(nn.Linear(64, 1), std=1.0)
 
-    def act(self, inputs, role):
-        if role == "policy":
-            return GaussianMixin.act(self, inputs, role=role)
-        return DeterministicMixin.act(self, inputs, role=role)
+    def features(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.backbone((obs - self.obs_mid) * self.obs_inv_scale)
 
-    def compute(self, inputs, role):
-        if role == "policy":
-            self._shared_output = self.backbone(inputs["observations"])
-            return self.policy_head(self._shared_output), {
-                "log_std": self.log_std_parameter
+    def value(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.critic(self.features(obs)).squeeze(-1)
+
+    def _dist(self, h: torch.Tensor) -> Normal:
+        mean = torch.tanh(self.actor_mean(h))
+        std = self.actor_logstd.exp().expand_as(mean)
+        return Normal(mean, std)
+
+    def act_value(
+        self, obs: torch.Tensor, action: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self.features(obs)
+        dist = self._dist(h)
+        if action is None:
+            action = dist.sample()
+        log_prob = dist.log_prob(action).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        value = self.critic(h).squeeze(-1)
+        return action, log_prob, entropy, value
+
+    def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.actor_mean(self.features(obs)))
+
+
+class KLAdaptiveLR:
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        target_kl: float = 0.01,
+        factor: float = 1.5,
+        min_lr: float = 1e-6,
+        max_lr: float = 1e-2,
+    ):
+        self.optimizer = optimizer
+        self.target = target_kl
+        self.factor = factor
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+
+    def step(self, kl: float) -> None:
+        for pg in self.optimizer.param_groups:
+            lr = pg["lr"]
+            if kl > 2.0 * self.target:
+                pg["lr"] = max(self.min_lr, lr / self.factor)
+            elif kl < 0.5 * self.target:
+                pg["lr"] = min(self.max_lr, lr * self.factor)
+
+    @property
+    def lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+
+def record_rollout(
+    env: RacingEnv,
+    agent: Agent,
+    num_steps: int,
+    output_path: Path,
+    deterministic: bool = True,
+) -> None:
+    saved = env.save_state()
+    was_training = agent.training
+    agent.eval()
+    try:
+        m = env.map
+        corners = np.array(
+            [
+                [-LENGTH / 2, -WIDTH / 2],
+                [LENGTH / 2, -WIDTH / 2],
+                [LENGTH / 2, WIDTH / 2],
+                [-LENGTH / 2, WIDTH / 2],
+            ]
+        )
+
+        def w2p(x, y):
+            return int((x - m.ox) / m.res), int(m.h - 1 - (y - m.oy) / m.res)
+
+        trail: deque = deque(maxlen=300)
+        obs, _ = env.reset()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with imageio.get_writer(
+            str(output_path), fps=int(1 / DT), macro_block_size=1
+        ) as writer:
+            for _ in range(num_steps):
+                with torch.no_grad():
+                    if deterministic:
+                        action = agent.deterministic(obs)
+                    else:
+                        action, *_ = agent.act_value(obs)
+                obs, _, term, trunc, _ = env.step(action)
+
+                x, y, psi = (float(v) for v in env._cars_buf[0, [0, 1, 4]])
+                if bool(term[0].item()) or bool(trunc[0].item()):
+                    trail.clear()
+                trail.append((x, y))
+
+                frame = cvtColor(m.raw, COLOR_GRAY2RGB)
+                if len(trail) > 1:
+                    polylines(
+                        frame,
+                        [np.array([w2p(*p) for p in trail], dtype=np.int32)],
+                        False,
+                        (0, 200, 0),
+                        2,
+                    )
+                R = np.array([[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]])
+                world = corners @ R.T + (x, y)
+                fillPoly(
+                    frame,
+                    [np.array([w2p(*p) for p in world], dtype=np.int32)],
+                    (255, 50, 50),
+                )
+                writer.append_data(frame)
+    finally:
+        env.restore_state(saved)
+        agent.train(was_training)
+
+
+def _wandb_log(metrics: dict, step: int, video_path: Path | None = None) -> None:
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+        if video_path is not None:
+            metrics = {
+                **metrics,
+                "rollout": wandb.Video(str(video_path), format="mp4"),
             }
-        shared = (
-            self.backbone(inputs["observations"])
-            if self._shared_output is None
-            else self._shared_output
-        )
-        self._shared_output = None
-        return self.value_head(shared), {}
+        wandb.log(metrics, step=step)
+    except Exception as exc:
+        print(f"[warporacer] wandb log failed: {exc}")
+
+
+def train(
+    env: RacingEnv,
+    agent: Agent,
+    iterations: int = 2000,
+    rollouts: int = 24,
+    learning_epochs: int = 5,
+    mini_batches: int = 4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip_coef: float = 0.2,
+    vf_clip_coef: float = 0.2,
+    vf_coef: float = 2.0,
+    ent_coef: float = 0.0,
+    max_grad_norm: float = 0.5,
+    learning_rate: float = 3e-4,
+    target_kl: float = 0.01,
+    log_dir: Path = Path("./logs"),
+    record_every: int = 100,
+    record_steps: int = 1800,
+) -> float:
+    device = next(agent.parameters()).device
+    num_envs = env.num_envs
+    optimizer = torch.optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
+    scheduler = KLAdaptiveLR(optimizer, target_kl=target_kl)
+
+    obs_buf = torch.zeros((rollouts, num_envs, OBS_DIM), device=device)
+    act_buf = torch.zeros((rollouts, num_envs, ACT_DIM), device=device)
+    logp_buf = torch.zeros((rollouts, num_envs), device=device)
+    rew_buf = torch.zeros((rollouts, num_envs), device=device)
+    done_buf = torch.zeros((rollouts, num_envs), device=device)
+    val_buf = torch.zeros((rollouts, num_envs), device=device)
+    ep_ret_buf = torch.zeros((rollouts, num_envs), device=device)
+    ep_len_buf = torch.zeros((rollouts, num_envs), device=device)
+
+    obs, _ = env.reset()
+    ep_returns = torch.zeros(num_envs, device=device)
+    ep_steps = torch.zeros(num_envs, device=device)
+    completed_returns: deque = deque(maxlen=100)
+    completed_lengths: deque = deque(maxlen=100)
+
+    global_step = 0
+    t0 = time.time()
+    last_t = t0
+
+    for it in range(iterations):
+        agent.eval()
+        for t in range(rollouts):
+            obs_buf[t] = obs
+            with torch.no_grad():
+                action, log_prob, _, value = agent.act_value(obs)
+            act_buf[t] = action
+            logp_buf[t] = log_prob
+            val_buf[t] = value
+
+            obs, reward, term, trunc, _ = env.step(action)
+            done = (term | trunc).float()
+            rew_buf[t] = reward
+            done_buf[t] = done
+            ep_returns += reward
+            ep_steps += 1
+            ep_ret_buf[t] = ep_returns
+            ep_len_buf[t] = ep_steps
+            nonterm = 1.0 - done
+            ep_returns = ep_returns * nonterm
+            ep_steps = ep_steps * nonterm
+
+        global_step += rollouts * num_envs
+
+        with torch.no_grad():
+            next_value = agent.value(obs)
+            adv_buf = torch.zeros_like(rew_buf)
+            last_gae = torch.zeros_like(next_value)
+            for t in reversed(range(rollouts)):
+                next_v = val_buf[t + 1] if t < rollouts - 1 else next_value
+                nonterm = 1.0 - done_buf[t]
+                delta = rew_buf[t] + gamma * next_v * nonterm - val_buf[t]
+                last_gae = delta + gamma * gae_lambda * nonterm * last_gae
+                adv_buf[t] = last_gae
+            ret_buf = adv_buf + val_buf
+
+        finished = done_buf.bool()
+        if finished.any():
+            completed_returns.extend(ep_ret_buf[finished].cpu().tolist())
+            completed_lengths.extend(ep_len_buf[finished].cpu().tolist())
+
+        b_obs = obs_buf.reshape(-1, OBS_DIM)
+        b_act = act_buf.reshape(-1, ACT_DIM)
+        b_logp = logp_buf.reshape(-1)
+        b_adv = adv_buf.reshape(-1)
+        b_ret = ret_buf.reshape(-1)
+        b_val = val_buf.reshape(-1)
+        batch_size = b_obs.shape[0]
+        mb_size = batch_size // mini_batches
+
+        agent.train()
+        kl_acc = clipfrac_acc = pg_acc = v_acc = ent_acc = 0.0
+        n_updates = 0
+
+        for epoch in range(learning_epochs):
+            perm = torch.randperm(batch_size, device=device)
+            for start in range(0, batch_size, mb_size):
+                mb = perm[start : start + mb_size]
+                _, new_logp, entropy, new_val = agent.act_value(b_obs[mb], b_act[mb])
+
+                logratio = new_logp - b_logp[mb]
+                ratio = logratio.exp()
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - logratio).mean()
+                    clipfrac = ((ratio - 1.0).abs() > clip_coef).float().mean()
+                kl_acc += approx_kl.item()
+                clipfrac_acc += clipfrac.item()
+
+                mb_adv = b_adv[mb]
+                mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+
+                pg_loss = torch.max(
+                    -mb_adv * ratio,
+                    -mb_adv * ratio.clamp(1.0 - clip_coef, 1.0 + clip_coef),
+                ).mean()
+
+                if vf_clip_coef > 0:
+                    v_clipped = b_val[mb] + (new_val - b_val[mb]).clamp(
+                        -vf_clip_coef, vf_clip_coef
+                    )
+                    v_loss = (
+                        0.5
+                        * torch.max(
+                            (new_val - b_ret[mb]).pow(2),
+                            (v_clipped - b_ret[mb]).pow(2),
+                        ).mean()
+                    )
+                else:
+                    v_loss = 0.5 * (new_val - b_ret[mb]).pow(2).mean()
+
+                ent = entropy.mean()
+                loss = pg_loss + vf_coef * v_loss - ent_coef * ent
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                optimizer.step()
+
+                pg_acc += pg_loss.item()
+                v_acc += v_loss.item()
+                ent_acc += ent.item()
+                n_updates += 1
+
+        mean_kl = kl_acc / n_updates
+        scheduler.step(mean_kl)
+
+        now = time.time()
+        sps = int(rollouts * num_envs / max(now - last_t, 1e-9))
+        last_t = now
+
+        metrics = {
+            "losses/policy_loss": pg_acc / n_updates,
+            "losses/value_loss": v_acc / n_updates,
+            "losses/entropy": ent_acc / n_updates,
+            "losses/approx_kl": mean_kl,
+            "losses/clipfrac": clipfrac_acc / n_updates,
+            "policy/std": agent.actor_logstd.exp().mean().item(),
+            "charts/learning_rate": scheduler.lr,
+            "charts/sps": sps,
+            "charts/iteration": it,
+        }
+        if completed_returns:
+            metrics["charts/episodic_return"] = float(np.mean(completed_returns))
+            metrics["charts/episodic_length"] = float(np.mean(completed_lengths))
+
+        _wandb_log(metrics, global_step)
+        if it % 10 == 0:
+            er = metrics.get("charts/episodic_return", float("nan"))
+            print(
+                f"[iter {it:5d}] step={global_step:>10d} sps={sps:>6d} "
+                f"ret={er:8.3f} kl={mean_kl:.4f} lr={scheduler.lr:.2e}"
+            )
+
+        if record_every > 0 and record_steps > 0 and (it + 1) % record_every == 0:
+            out = log_dir / f"rollout_iter{it + 1:06d}.mp4"
+            try:
+                record_rollout(env, agent, record_steps, out)
+                _wandb_log({}, global_step, video_path=out)
+            except Exception as exc:
+                print(f"[warporacer] rollout at iter {it + 1} failed: {exc}")
+
+    return time.time() - t0
 
 
 def main(
@@ -606,67 +918,60 @@ def main(
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
+    record: int = 1800,
+    record_every: int = 100,
+    record_steps: int = 1800,
+    use_wandb: bool = True,
 ):
-    set_seed(seed)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    env = WarpEnvWrapper(
-        RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
+    env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
+    agent = Agent().to(env.device)
+
+    if use_wandb:
+        try:
+            import wandb
+
+            wandb.init(
+                project="warporacer",
+                name=f"seed{seed}_n{num_envs}",
+                config={
+                    "num_envs": num_envs,
+                    "iterations": iterations,
+                    "seed": seed,
+                    "map": str(map_yaml),
+                    "obs_dim": OBS_DIM,
+                    "act_dim": ACT_DIM,
+                },
+            )
+        except Exception as exc:
+            print(f"[warporacer] wandb init failed: {exc}")
+
+    elapsed = train(
+        env,
+        agent,
+        iterations=iterations,
+        log_dir=log_dir,
+        record_every=record_every,
+        record_steps=record_steps,
+    )
+    print(
+        f"[warporacer] training finished in {elapsed:.1f}s "
+        f"({env.nan_events} sanitized NaN events)"
     )
 
-    rollouts = 24
-    memory = RandomMemory(
-        memory_size=rollouts, num_envs=env.num_envs, device=env.device
-    )
+    torch.save(agent.state_dict(), log_dir / "agent_final.pt")
 
-    model = ActorCritic(
-        env.observation_space, env.state_space, env.action_space, env.device
-    )
-    models = {"policy": model, "value": model}
-
-    cfg = PPO_CFG()
-    cfg.rollouts = rollouts
-    cfg.learning_epochs = 5
-    cfg.mini_batches = 4
-    cfg.discount_factor = 0.99
-    cfg.gae_lambda = 0.95
-    cfg.learning_rate = 3e-4
-    cfg.learning_rate_scheduler = KLAdaptiveLR
-    cfg.learning_rate_scheduler_kwargs = {"kl_threshold": 0.01}
-    cfg.grad_norm_clip = 0.5
-    cfg.ratio_clip = 0.2
-    cfg.value_clip = 0.2
-    cfg.entropy_loss_scale = 0.0
-    cfg.value_loss_scale = 2.0
-    cfg.kl_threshold = 0
-    cfg.time_limit_bootstrap = False
-    cfg.observation_preprocessor = RunningStandardScaler
-    cfg.observation_preprocessor_kwargs = {
-        "size": env.observation_space,
-        "device": env.device,
-    }
-    cfg.value_preprocessor = RunningStandardScaler
-    cfg.value_preprocessor_kwargs = {"size": 1, "device": env.device}
-    cfg.experiment.directory = str(log_dir)
-    cfg.experiment.experiment_name = "warporacer"
-    cfg.experiment.write_interval = "auto"
-    cfg.experiment.checkpoint_interval = "auto"
-
-    agent = PPO(
-        models=models,
-        memory=memory,
-        cfg=cfg,
-        observation_space=env.observation_space,
-        state_space=env.state_space,
-        action_space=env.action_space,
-        device=env.device,
-    )
-
-    trainer = SequentialTrainer(
-        cfg={"timesteps": iterations * rollouts, "headless": True},
-        env=env,
-        agents=agent,
-    )
-    trainer.train()
+    if record > 0:
+        out = log_dir / "rollout.mp4"
+        record_rollout(env, agent, record, out)
+        _wandb_log({}, iterations * 24 * num_envs, video_path=out)
 
 
 if __name__ == "__main__":

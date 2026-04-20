@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "gymnasium>=1.2.3",
+    "imageio[ffmpeg]>=2.37.3",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "pyyaml>=6.0.3",
@@ -14,5 +15,7 @@ dependencies = [
     "skrl>=2.0.0",
     "torch>=2.11.0",
     "typer>=0.24.1",
+    "wandb>=0.26.0",
     "warp-lang>=1.12.1",
+    "warp-nn>=0.1.0",
 ]
