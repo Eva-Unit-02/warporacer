@@ -347,11 +347,9 @@ class Map:
 
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
-
         pts = np.argwhere(skeleton)
         origin_px = [self.h - 1 + self.oy / self.res, -self.ox / self.res]
         start = tuple(pts[np.argmin(np.linalg.norm(pts - origin_px, axis=1))])
-
         nbrs = [
             (start[0] + dr, start[1] + dc)
             for dr, dc in ADJ
@@ -370,7 +368,6 @@ class Map:
                         q.clear()
                         break
                     q.append(n)
-
         path = [start]
         n = target
         while n != src:
@@ -378,7 +375,6 @@ class Map:
             n = parent[n]
         path.append(src)
         path.reverse()
-
         rc = np.array(path)
         world = np.column_stack(
             [
@@ -387,8 +383,8 @@ class Map:
             ]
         )
         self.centerline = savgol_filter(world, smooth_window, 3, axis=0, mode="wrap")
-        self.diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
-        self.angles = np.arctan2(self.diffs[:, 1], self.diffs[:, 0])
+        diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
+        self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
 
     def _build_lut(self):
         centerline_px = np.column_stack(
@@ -500,8 +496,6 @@ class RacingEnv:
 
 
 class WarpEnvWrapper(Wrapper):
-    """skrl 2.0 wrapper around RacingEnv (torch tensors throughout)."""
-
     @property
     def observation_space(self):
         return self._env.observation_space
@@ -542,14 +536,14 @@ class WarpEnvWrapper(Wrapper):
         pass
 
 
-class Policy(GaussianMixin, Model):
+class ActorCritic(GaussianMixin, DeterministicMixin, Model):
     def __init__(
         self,
         observation_space,
         state_space,
         action_space,
         device,
-        clip_actions=False,
+        clip_actions=True,
         clip_log_std=True,
         min_log_std=-20,
         max_log_std=2,
@@ -570,44 +564,39 @@ class Policy(GaussianMixin, Model):
             max_log_std=max_log_std,
             reduction=reduction,
         )
-        self.net = nn.Sequential(
-            nn.Linear(self.num_observations, 256),
-            nn.ELU(),
-            nn.Linear(256, 128),
-            nn.ELU(),
-            nn.Linear(128, 64),
-            nn.ELU(),
-            nn.Linear(64, self.num_actions),
-            nn.Tanh(),
-        )
-        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
-
-    def compute(self, inputs, role):
-        return self.net(inputs["observations"]), {"log_std": self.log_std_parameter}
-
-
-class Value(DeterministicMixin, Model):
-    def __init__(self, observation_space, state_space, action_space, device):
-        Model.__init__(
-            self,
-            observation_space=observation_space,
-            state_space=state_space,
-            action_space=action_space,
-            device=device,
-        )
         DeterministicMixin.__init__(self)
-        self.net = nn.Sequential(
+
+        self.backbone = nn.Sequential(
             nn.Linear(self.num_observations, 256),
             nn.ELU(),
             nn.Linear(256, 128),
             nn.ELU(),
             nn.Linear(128, 64),
             nn.ELU(),
-            nn.Linear(64, 1),
         )
+        self.policy_head = nn.Sequential(nn.Linear(64, self.num_actions), nn.Tanh())
+        self.value_head = nn.Linear(64, 1)
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+        self._shared_output = None
+
+    def act(self, inputs, role):
+        if role == "policy":
+            return GaussianMixin.act(self, inputs, role=role)
+        return DeterministicMixin.act(self, inputs, role=role)
 
     def compute(self, inputs, role):
-        return self.net(inputs["observations"]), {}
+        if role == "policy":
+            self._shared_output = self.backbone(inputs["observations"])
+            return self.policy_head(self._shared_output), {
+                "log_std": self.log_std_parameter
+            }
+        shared = (
+            self.backbone(inputs["observations"])
+            if self._shared_output is None
+            else self._shared_output
+        )
+        self._shared_output = None
+        return self.value_head(shared), {}
 
 
 def main(
@@ -629,14 +618,10 @@ def main(
         memory_size=rollouts, num_envs=env.num_envs, device=env.device
     )
 
-    models = {
-        "policy": Policy(
-            env.observation_space, env.state_space, env.action_space, env.device
-        ),
-        "value": Value(
-            env.observation_space, env.state_space, env.action_space, env.device
-        ),
-    }
+    model = ActorCritic(
+        env.observation_space, env.state_space, env.action_space, env.device
+    )
+    models = {"policy": model, "value": model}
 
     cfg = PPO_CFG()
     cfg.rollouts = rollouts
@@ -644,15 +629,16 @@ def main(
     cfg.mini_batches = 4
     cfg.discount_factor = 0.99
     cfg.gae_lambda = 0.95
-    cfg.learning_rate = 1e-3
+    cfg.learning_rate = 3e-4
     cfg.learning_rate_scheduler = KLAdaptiveLR
     cfg.learning_rate_scheduler_kwargs = {"kl_threshold": 0.01}
-    cfg.grad_norm_clip = 1.0
+    cfg.grad_norm_clip = 0.5
     cfg.ratio_clip = 0.2
     cfg.value_clip = 0.2
-    cfg.entropy_loss_scale = 0.005
-    cfg.value_loss_scale = 1.0
+    cfg.entropy_loss_scale = 0.0
+    cfg.value_loss_scale = 2.0
     cfg.kl_threshold = 0
+    cfg.time_limit_bootstrap = False
     cfg.observation_preprocessor = RunningStandardScaler
     cfg.observation_preprocessor_kwargs = {
         "size": env.observation_space,
