@@ -355,11 +355,13 @@ def step_kernel(
     elif 2 * d_wp < -num_centerline_pts:
         d_wp += num_centerline_pts
 
+    cth_pt = centerline[new_car_waypoint][2]
+    v_along = car_v * wp.cos(car_beta + car_psi - cth_pt)
     progress = (
         wp.float32(d_wp)
         / wp.float32(num_centerline_pts)
         * PROGRESS_SCALE
-        * (1.0 + wp.max(car_v, 0.0) / PROGRESS_V_COEF)
+        * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
     wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
     lr_eff = LENGTH_REAR * lr_s
@@ -370,8 +372,9 @@ def step_kernel(
     )
     excess = wp.max(wp.abs(alpha_r) - 0.08, 0.0)
     slip = -SLIP_PENALTY_COEF * excess * excess
+    steer_pen = -0.02 * (steer_v / STEER_V_MAX) * (steer_v / STEER_V_MAX)
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + wall + slip + term_pen
+    reward[i] = progress + wall + slip + steer_pen + term_pen
 
     if term:
         done[i] = DONE_TERMINATED
