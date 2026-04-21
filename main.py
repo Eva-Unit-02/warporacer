@@ -94,6 +94,7 @@ class VDeriv:
     d_psi: float
     d_psip: float
     d_beta: float
+    d_v: float
 
 
 @wp.func
@@ -113,66 +114,26 @@ def st_deriv(
     lf = LF * lf_s
     lr = LR * lr_s
     lwb = lf + lr
-    inv_lwb = 1.0 / lwb
-    mass = MASS * mass_s
     mu = MU * mu_s
+    a_max = mu * G
 
     tand = wp.tan(delta)
-    cosd = wp.cos(delta)
-    cosd2 = cosd * cosd
-    tl = tand * lr * inv_lwb
-    inv_sq = 1.0 / wp.sqrt(1.0 + tl * tl)
-    cbk = inv_sq
-    sbk = tl * inv_sq
+    d_psi_kin = v * tand / lwb
+    d_psi_cap = a_max / wp.max(wp.abs(v), 0.5)
+    d_psi = wp.clamp(d_psi_kin, -d_psi_cap, d_psi_cap)
+
+    a_lat = v * d_psi
+    a_long_max = wp.sqrt(wp.max(a_max * a_max - a_lat * a_lat, 0.0))
+
     cp = wp.cos(psi)
     sp = wp.sin(psi)
-
-    # Kinematic
-    dx_k = v * (cbk * cp - sbk * sp)
-    dy_k = v * (sbk * cp + cbk * sp)
-    dpsi_k = v * cbk * tand * inv_lwb
-    dbeta_k = lr * steer_v * inv_lwb / cosd2 * inv_sq * inv_sq
-    dpsip_k = inv_lwb * (
-        accel * cbk * tand - v * sbk * dbeta_k * tand + v * cbk * steer_v / cosd2
-    )
-
-    # Dynamic
-    v_safe = wp.max(v, V_BLEND_MIN)
-    inv_v = 1.0 / v_safe
-    g_lr_a = G * lr - accel * H_CG
-    g_lf_a = G * lf + accel * H_CG
-    cf_a = C_SF * g_lr_a
-    cr_a = C_SR * g_lf_a
-    lf_cf = lf * cf_a
-    lr_cr = lr * cr_a
-    mm_il = mu * mass * inv_lwb / I_Z
-    m_vl = mu * inv_lwb * inv_v
-
-    dpsip_d = (
-        -mm_il * inv_v * (lf * lf_cf + lr * lr_cr) * psip
-        + mm_il * (lr_cr - lf_cf) * beta
-        + mm_il * lf_cf * delta
-    )
-    dbeta_d = (
-        (m_vl * inv_v * (lr_cr - lf_cf) - 1.0) * psip
-        - m_vl * (cr_a + cf_a) * beta
-        + m_vl * cf_a * delta
-    )
-    cb = wp.cos(beta)
-    sb = wp.sin(beta)
-    dx_d = v * (cb * cp - sb * sp)
-    dy_d = v * (sb * cp + cb * sp)
-    dpsi_d = psip
-
-    # Blend
-    w_dyn = 0.5 * (wp.tanh((v - V_SWITCH) / V_BLEND_WIDTH) + 1.0)
-    w_kin = 1.0 - w_dyn
     out = VDeriv()
-    out.d_x = w_kin * dx_k + w_dyn * dx_d
-    out.d_y = w_kin * dy_k + w_dyn * dy_d
-    out.d_psi = w_kin * dpsi_k + w_dyn * dpsi_d
-    out.d_psip = w_kin * dpsip_k + w_dyn * dpsip_d
-    out.d_beta = w_kin * dbeta_k + w_dyn * dbeta_d
+    out.d_x = v * cp
+    out.d_y = v * sp
+    out.d_psi = d_psi
+    out.d_v = wp.clamp(accel, -a_long_max, a_long_max)
+    out.d_psip = 0.0
+    out.d_beta = 0.0
     return out
 
 
@@ -191,14 +152,12 @@ def rk4_step(
     lr_s: float,
 ) -> VDeriv:
     dd = steer_v * DT_SUB_HALF
-    dv = accel * DT_SUB_HALF
     dd_full = steer_v * DT_SUB
-    dv_full = accel * DT_SUB
 
     k1 = st_deriv(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
     k2 = st_deriv(
         delta + dd,
-        v + dv,
+        v + k1.d_v * DT_SUB_HALF,
         psi + k1.d_psi * DT_SUB_HALF,
         psip + k1.d_psip * DT_SUB_HALF,
         beta + k1.d_beta * DT_SUB_HALF,
@@ -211,7 +170,7 @@ def rk4_step(
     )
     k3 = st_deriv(
         delta + dd,
-        v + dv,
+        v + k2.d_v * DT_SUB_HALF,
         psi + k2.d_psi * DT_SUB_HALF,
         psip + k2.d_psip * DT_SUB_HALF,
         beta + k2.d_beta * DT_SUB_HALF,
@@ -224,7 +183,7 @@ def rk4_step(
     )
     k4 = st_deriv(
         delta + dd_full,
-        v + dv_full,
+        v + k3.d_v * DT_SUB,
         psi + k3.d_psi * DT_SUB,
         psip + k3.d_psip * DT_SUB,
         beta + k3.d_beta * DT_SUB,
@@ -239,6 +198,7 @@ def rk4_step(
     out.d_x = (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT_SUB_SIX
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
+    out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
     out.d_psip = (
         k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip
     ) * DT_SUB_SIX
@@ -295,15 +255,24 @@ def step_kernel(
         accel = 0.0
 
     dd_sub = steer_v * DT_SUB
-    dv_sub = accel * DT_SUB
     for _ in range(SUBSTEPS):
         d = rk4_step(
-            delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s
+            delta,
+            v,
+            psi,
+            psip,
+            beta,
+            steer_v,
+            accel,
+            mu_s,
+            mass_s,
+            lf_s,
+            lr_s,
         )
         x += d.d_x
         y += d.d_y
         delta += dd_sub
-        v += dv_sub
+        v += d.d_v
         psi += d.d_psi
         psip += d.d_psip
         beta += d.d_beta
