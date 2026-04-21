@@ -362,8 +362,14 @@ def step_kernel(
         * (1.0 + wp.max(car_v, 0.0) / PROGRESS_V_COEF)
     )
     wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
-    beta_kin = wp.atan(wp.tan(car_delta) * LENGTH_REAR / LENGTH_WHEELBASE)
-    slip = -SLIP_PENALTY_COEF * (car_beta - beta_kin) * (car_beta - beta_kin)
+    lr_eff = LENGTH_REAR * lr_s
+    v_slip = wp.max(car_v, 2.0)
+    alpha_r = wp.atan(
+        (lr_eff * car_psi_prime - car_v * wp.sin(car_beta))
+        / (v_slip * wp.cos(car_beta))
+    )
+    excess = wp.max(wp.abs(alpha_r) - 0.08, 0.0)
+    slip = -SLIP_PENALTY_COEF * excess * excess
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = progress + wall + slip + term_pen
 
