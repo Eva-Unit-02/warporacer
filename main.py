@@ -71,6 +71,7 @@ DR_FRAC = 0.15
 WALL_PENALTY_COEF = 0.1
 WALL_PENALTY_RATE = 3.0
 TERM_PENALTY = 100.0
+SLIP_PENALTY_COEF = 1.0
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 
@@ -352,10 +353,11 @@ def step_kernel(
         * (1.0 + wp.max(car_v, 0.0) / PROGRESS_V_COEF)
     )
     wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
+    slip = -SLIP_PENALTY_COEF * car_beta * car_beta
     term_pen = float(0.0)
     if term:
         term_pen = -TERM_PENALTY
-    reward[i] = progress + wall + term_pen
+    reward[i] = progress + wall + slip + term_pen
 
     if term:
         done[i] = DONE_TERMINATED
@@ -383,12 +385,6 @@ def step_kernel(
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
-        car_px = wp.clamp(wp.int32((car_x - origin_x) / res), 0, map_w - 1)
-        car_py = wp.clamp(
-            wp.int32(wp.float32(map_h) - 1.0 - (car_y - origin_y) / res),
-            0,
-            map_h - 1,
-        )
 
     sh = wp.sin(car_psi)
     ch = wp.cos(car_psi)
@@ -405,19 +401,21 @@ def step_kernel(
 
     for j in range(lidar_dirs.shape[0]):
         ray = lidar_pos_px
+        dist_px = float(0.0)
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
         d_px = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
-        while wp.length(ray - lidar_pos_px) * res < LIDAR_RANGE:
+        while dist_px * res < LIDAR_RANGE:
             ray_px = wp.int32(ray[0])
             ray_py = wp.int32(ray[1])
             if ray_px < 0 or ray_px >= map_w or ray_py < 0 or ray_py >= map_h:
                 break
             dt_ray = distance_transform_px[ray_px, ray_py]
             ray += d_px * dt_ray
+            dist_px += dt_ray
             if dt_ray == 0.0:
                 break
-        observation[i, j + 3] = wp.min(wp.length(ray - lidar_pos_px) * res, LIDAR_RANGE)
+        observation[i, j + 3] = wp.min(dist_px * res, LIDAR_RANGE)
 
     cx_pt = centerline[new_car_waypoint][0]
     cy_pt = centerline[new_car_waypoint][1]
@@ -541,7 +539,6 @@ class Map:
 
 
 class RacingEnv:
-    observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), dtype=np.float32)
     action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
 
     def __init__(
@@ -550,9 +547,15 @@ class RacingEnv:
         num_envs: int,
         seed: int = 0,
         device: str | None = None,
+        use_centerline_obs: bool = True,
     ):
         wp.init()
         self.num_envs = num_envs
+        self.use_centerline_obs = use_centerline_obs
+        self.obs_dim = OBS_DIM if use_centerline_obs else OBS_FRENET_OFF
+        self.observation_space = gym.spaces.Box(
+            -np.inf, np.inf, (self.obs_dim,), dtype=np.float32
+        )
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.map = Map(map_path)
         self.look_step = self.map.look_step
@@ -591,6 +594,7 @@ class RacingEnv:
         self.done = wp.zeros(num_envs, dtype=int, device=d)
 
         self.obs_buf = wp.to_torch(self.obs)
+        self._obs_view = self.obs_buf[:, : self.obs_dim]
         self.rew_buf = wp.to_torch(self.rew)
         self.done_buf = wp.to_torch(self.done)
         self.cars_buf = wp.to_torch(self.cars)
@@ -661,14 +665,14 @@ class RacingEnv:
         self._step_counter.zero_()
         self.rew_buf.zero_()
         self.done_buf.zero_()
-        return self.obs_buf, {}
+        return self._obs_view, {}
 
     def step(self, actions):
         self._launch(wp.from_torch(actions.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
         terminated = self.done_buf == DONE_TERMINATED
         truncated = self.done_buf == DONE_TRUNCATED
-        return self.obs_buf, self.rew_buf, terminated, truncated, {}
+        return self._obs_view, self.rew_buf, terminated, truncated, {}
 
     def save_state(self):
         return {
@@ -837,37 +841,39 @@ def record_rollout(
         with imageio.get_writer(
             str(output_path), fps=int(1 / DT), macro_block_size=1
         ) as writer:
-            for _ in range(num_steps):
-                with torch.no_grad():
+            with torch.no_grad():
+                for _ in range(num_steps):
                     if deterministic:
                         action = agent.deterministic(obs)
                     else:
                         action, *_ = agent.act_value(obs)
-                raw_obs, _, term, trunc, _ = env.step(action)
-                obs = obs_rms.normalize(raw_obs) if obs_rms is not None else raw_obs
+                    raw_obs, _, term, trunc, _ = env.step(action)
+                    obs = obs_rms.normalize(raw_obs) if obs_rms is not None else raw_obs
 
-                x, y, psi = (float(v) for v in env.cars_buf[0, [0, 1, 4]])
-                if bool(term[0].item()) or bool(trunc[0].item()):
-                    trail.clear()
-                trail.append((x, y))
+                    x, y, psi = (float(v) for v in env.cars_buf[0, [0, 1, 4]])
+                    if bool(term[0].item()) or bool(trunc[0].item()):
+                        trail.clear()
+                    trail.append((x, y))
 
-                frame = cvtColor(m.raw, COLOR_GRAY2RGB)
-                if len(trail) > 1:
-                    polylines(
-                        frame,
-                        [np.array([w2p(*p) for p in trail], dtype=np.int32)],
-                        False,
-                        (0, 200, 0),
-                        2,
+                    frame = cvtColor(m.raw, COLOR_GRAY2RGB)
+                    if len(trail) > 1:
+                        polylines(
+                            frame,
+                            [np.array([w2p(*p) for p in trail], dtype=np.int32)],
+                            False,
+                            (0, 200, 0),
+                            2,
+                        )
+                    R = np.array(
+                        [[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]]
                     )
-                R = np.array([[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]])
-                world = corners @ R.T + (x, y)
-                fillPoly(
-                    frame,
-                    [np.array([w2p(*p) for p in world], dtype=np.int32)],
-                    (255, 50, 50),
-                )
-                writer.append_data(frame)
+                    world = corners @ R.T + (x, y)
+                    fillPoly(
+                        frame,
+                        [np.array([w2p(*p) for p in world], dtype=np.int32)],
+                        (255, 50, 50),
+                    )
+                    writer.append_data(frame)
     finally:
         env.restore_state(saved)
         agent.train(was_training)
@@ -907,13 +913,14 @@ def train(
 ):
     device = next(agent.parameters()).device
     num_envs = env.num_envs
+    obs_dim = env.obs_dim
     optimizer = torch.optim.Adam(agent.parameters(), lr=learning_rate, eps=1e-5)
     scheduler = KLAdaptiveLR(optimizer, target_kl=target_kl)
 
-    obs_rms = RunningMeanStd((OBS_DIM,), device)
+    obs_rms = RunningMeanStd((obs_dim,), device)
     ret_rms = ReturnNormalizer(num_envs, gamma, device)
 
-    obs_buf = torch.zeros((rollouts, num_envs, OBS_DIM), device=device)
+    obs_buf = torch.zeros((rollouts, num_envs, obs_dim), device=device)
     act_buf = torch.zeros((rollouts, num_envs, ACT_DIM), device=device)
     logp_buf = torch.zeros((rollouts, num_envs), device=device)
     rew_buf = torch.zeros((rollouts, num_envs), device=device)
@@ -985,7 +992,7 @@ def train(
             completed_returns.extend(ep_ret_buf[finished].cpu().tolist())
             completed_lengths.extend(ep_len_buf[finished].cpu().tolist())
 
-        b_obs = obs_buf.reshape(-1, OBS_DIM)
+        b_obs = obs_buf.reshape(-1, obs_dim)
         b_act = act_buf.reshape(-1, ACT_DIM)
         b_logp = logp_buf.reshape(-1)
         b_adv = adv_buf.reshape(-1)
@@ -1118,6 +1125,7 @@ def main(
     record_every: int = 100,
     record_steps: int = 1800,
     use_wandb: bool = True,
+    use_centerline_obs: bool = True,
 ):
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
@@ -1127,8 +1135,14 @@ def main(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
-    agent = Agent().to(env.device)
+    env = RacingEnv(
+        map_yaml,
+        num_envs=num_envs,
+        seed=seed,
+        device=device or None,
+        use_centerline_obs=use_centerline_obs,
+    )
+    agent = Agent(obs_dim=env.obs_dim).to(env.device)
 
     if use_wandb and wandb is not None:
         try:
@@ -1140,7 +1154,8 @@ def main(
                     "iterations": iterations,
                     "seed": seed,
                     "map": str(map_yaml),
-                    "obs_dim": OBS_DIM,
+                    "obs_dim": env.obs_dim,
+                    "use_centerline_obs": use_centerline_obs,
                     "act_dim": ACT_DIM,
                     "substeps": SUBSTEPS,
                     "dr_frac": DR_FRAC,
