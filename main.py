@@ -27,8 +27,8 @@ from yaml import safe_load
 import wandb
 
 MU = 1.0489
-C_SF = 4.718  # front cornering stiffness coefficient
-C_SR = 5.4562  # rear cornering stiffness coefficient
+C_SF = 4.718
+C_SR = 5.4562
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
@@ -48,7 +48,7 @@ V_MAX = 20.0
 PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
-# Car constants
+# Car
 WIDTH = 0.31
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
@@ -59,7 +59,7 @@ DT_SUB = DT / float(SUBSTEPS)
 DT_SUB_HALF = DT_SUB * 0.5
 DT_SUB_SIX = DT_SUB / 6.0
 
-DR_FRAC = 0.15  # +/- 15% on (mu, mass, lf, lr) per episode
+DR_FRAC = 0.15
 
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
@@ -127,7 +127,7 @@ def st_deriv(
     cp = wp.cos(psi)
     sp = wp.sin(psi)
 
-    # --- Kinematic (low-speed) ---
+    # Kinematic
     dx_k = v * (cbk * cp - sbk * sp)
     dy_k = v * (sbk * cp + cbk * sp)
     dpsi_k = v * cbk * tand * inv_lwb
@@ -136,7 +136,7 @@ def st_deriv(
         accel * cbk * tand - v * sbk * dbeta_k * tand + v * cbk * steer_v / cosd2
     )
 
-    # --- Dynamic (high-speed, linear cornering stiffness) ---
+    # Dynamic
     v_safe = wp.max(v, V_BLEND_MIN)
     inv_v = 1.0 / v_safe
     g_lr_a = G * lr - accel * H_CG
@@ -164,7 +164,7 @@ def st_deriv(
     dy_d = v * (sb * cp + cb * sp)
     dpsi_d = psip
 
-    # --- Smooth blend ---
+    # Blend
     w_dyn = 0.5 * (wp.tanh((v - V_SWITCH) / V_BLEND_WIDTH) + 1.0)
     w_kin = 1.0 - w_dyn
     out = VDeriv()
@@ -254,9 +254,9 @@ def step_kernel(
     obs: wp.array2d(dtype=wp.float32),
     reward: wp.array(dtype=wp.float32),
     done: wp.array(dtype=wp.int32),
-    cars: wp.array2d(dtype=wp.float32),  # (N, 7) sx,sy,delta,v,psi,psip,beta
-    cars_int: wp.array2d(dtype=wp.int32),  # (N, 2) steps, waypoint
-    car_dr: wp.array2d(dtype=wp.float32),  # (N, 4) mu_s, mass_s, lf_s, lr_s
+    cars: wp.array2d(dtype=wp.float32),
+    cars_int: wp.array2d(dtype=wp.int32),
+    car_dr: wp.array2d(dtype=wp.float32),
     origin: wp.vec2,
     res: float,
     dt_map: wp.array2d(dtype=wp.float32),
@@ -286,7 +286,7 @@ def step_kernel(
     mh = dt_map.shape[1]
     mh_f = wp.float32(mh) - 1.0
 
-    # --- Input constraints ---
+    # Input
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
@@ -313,7 +313,7 @@ def step_kernel(
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    # --- Crash / progress ---
+    # Reward + done
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     edt_val = dt_map[px, py] * res
@@ -347,7 +347,7 @@ def step_kernel(
     else:
         done[i] = 0
 
-    # --- Reset on term/trunc: resample waypoint AND domain-rand params ---
+    # Reset
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
         rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl)) % n_cl
@@ -366,7 +366,7 @@ def step_kernel(
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    # --- LIDAR (EDT sphere-trace) ---
+    # Lidar
     sh = wp.sin(psi)
     ch = wp.cos(psi)
     lx = x + LF * ch
@@ -393,7 +393,7 @@ def step_kernel(
                 break
         obs[i, 3 + j] = wp.min(dist, lrange_px) * res
 
-    # --- Frenet + lookahead ---
+    # Frenet + lookahead
     cpt = centerline[new_wp]
     cx_p = cpt[0]
     cy_p = cpt[1]
@@ -430,9 +430,7 @@ def step_kernel(
     cars_int[i, 1] = new_wp
 
 
-# ============================================================================
-# Map + centerline
-# ============================================================================
+# Map
 class Map:
     def __init__(self, path: Path):
         self.meta = safe_load(path.read_text())
@@ -513,9 +511,7 @@ class Map:
         )[1].reshape(rows.shape)
 
 
-# ============================================================================
-# Vectorised env
-# ============================================================================
+# Env
 class RacingEnv:
     action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
     observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
@@ -574,7 +570,7 @@ class RacingEnv:
         )
         self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
         self._call = 0
-        # warm-up reset so obs is populated
+        # Warm-up reset
         self._launch(self._zero_act)
         self._sanitize()
         self._step_counter.zero_()
@@ -657,9 +653,7 @@ class RacingEnv:
         self.done_buf.copy_(s["done_buf"])
 
 
-# ============================================================================
-# Normalization / Agent / Scheduler
-# ============================================================================
+# PPO components
 class RunningMeanStd:
     def __init__(self, shape, device):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -764,9 +758,7 @@ class KLAdaptiveLR:
         return self.opt.param_groups[0]["lr"]
 
 
-# ============================================================================
-# Video rollout
-# ============================================================================
+# Rollout video
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     snap = env.save_state()
     was_training = agent.training
@@ -826,9 +818,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         agent.train(was_training)
 
 
-# ============================================================================
-# PPO training loop
-# ============================================================================
+# PPO training
 def train(
     env,
     agent,
