@@ -139,24 +139,25 @@ def st_deriv(
     # --- Dynamic (high-speed, linear cornering stiffness) ---
     v_safe = wp.max(v, V_BLEND_MIN)
     inv_v = 1.0 / v_safe
+    g_lr_a = G * lr - accel * H_CG
+    g_lf_a = G * lf + accel * H_CG
+    cf_a = C_SF * g_lr_a
+    cr_a = C_SR * g_lf_a
+    lf_cf = lf * cf_a
+    lr_cr = lr * cr_a
+    mm_il = mu * mass * inv_lwb / I_Z
+    m_vl = mu * inv_lwb * inv_v
 
-    # Linearised slip angles (same approximation used by the linear model
-    # the saturation below replaces).
-    alpha_f = beta + lf * psip * inv_v - delta
-    alpha_r = beta - lr * psip * inv_v
-
-    # Vertical loads with longitudinal load transfer.
-    fzf = mass * (G * lr - accel * H_CG) * inv_lwb
-    fzr = mass * (G * lf + accel * H_CG) * inv_lwb
-
-    # Saturating lateral force:
-    #   small |α|  →  F_y ≈ -C·μ·F_z·α        (matches the old linear model)
-    #   large |α|  →  F_y →  ∓μ·F_z           (friction ceiling, can't drift harder)
-    f_yf = -mu * fzf * wp.tanh(C_SF * alpha_f)
-    f_yr = -mu * fzr * wp.tanh(C_SR * alpha_r)
-
-    dpsip_d = (lf * f_yf - lr * f_yr) / I_Z
-    dbeta_d = (f_yf + f_yr) / (mass * v_safe) - psip
+    dpsip_d = (
+        -mm_il * inv_v * (lf * lf_cf + lr * lr_cr) * psip
+        + mm_il * (lr_cr - lf_cf) * beta
+        + mm_il * lf_cf * delta
+    )
+    dbeta_d = (
+        (m_vl * inv_v * (lr_cr - lf_cf) - 1.0) * psip
+        - m_vl * (cr_a + cf_a) * beta
+        + m_vl * cf_a * delta
+    )
     cb = wp.cos(beta)
     sb = wp.sin(beta)
     dx_d = v * (cb * cp - sb * sp)
