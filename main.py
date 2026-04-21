@@ -71,7 +71,7 @@ DR_FRAC = 0.15
 WALL_PENALTY_COEF = 0.1
 WALL_PENALTY_RATE = 3.0
 TERM_PENALTY = 100.0
-SLIP_PENALTY_COEF = 1.0
+SLIP_PENALTY_COEF = 0.1
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 
@@ -781,7 +781,7 @@ class Agent(nn.Module):
 
     def _dist(self, obs):
         mean = self.actor(obs)
-        log_std = self.actor_logstd.expand_as(mean).clamp(-5.0, 0.5)
+        log_std = self.actor_logstd.expand_as(mean).clamp(-5.0, -0.3)
         return Normal(mean, log_std.exp())
 
     def act_value(self, obs, action=None, need_entropy: bool = True):
@@ -804,7 +804,7 @@ class KLAdaptiveLR:
         target_kl: float = 0.02,
         factor: float = 1.5,
         min_lr: float = 1e-6,
-        max_lr: float = 1e-2,
+        max_lr: float = 3e-3,
     ):
         self.optimizer = optimizer
         self.target = target_kl
@@ -921,7 +921,7 @@ def train(
     clip_coef: float = 0.2,
     vf_clip_coef: float = 0.2,
     vf_coef: float = 0.5,
-    ent_coef: float = 0.01,
+    ent_coef: float = 0.0,
     max_grad_norm: float = 0.5,
     learning_rate: float = 3e-4,
     target_kl: float = 0.02,
@@ -1075,6 +1075,8 @@ def train(
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
                 optimizer.step()
+                with torch.no_grad():
+                    agent.actor_logstd.clamp_(-5.0, -0.3)
 
                 pg_t += pg_loss.detach()
                 v_t += v_loss.detach()
