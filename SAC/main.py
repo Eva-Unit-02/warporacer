@@ -18,14 +18,14 @@ def main(
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
-    buffer_size: int = 250_000,
+    buffer_size: int = 5_000_000,
     batch_size: int = 1024,
-    learning_starts: int = 20_000,
+    learning_starts: int = 500_000,
     updates_per_iter: int = 0,
     gamma: float = 0.99,
     tau: float = 0.005,
     actor_lr: float = 3e-4,
-    critic_lr: float = 1e-3,
+    critic_lr: float = 5e-4,
     alpha_lr: float = 1e-3,
     policy_frequency: int = 2,
     autotune: bool = True,
@@ -48,7 +48,7 @@ def main(
         seed=seed,
         device=device or None,
     )
-    
+
     agent = SACAgent(obs_dim=OBS_DIM, action_space=env.action_space).to(env.device)
 
     if use_wandb:
