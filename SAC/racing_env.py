@@ -238,7 +238,7 @@ def step_kernel(
         * (wp.abs(steer_v) / STEER_V_MAX)
         * wp.max(LOW_SPEED_STEER_V_THRESH - v_along, 0.0)
     )
-    slip_pen = SLIP_PENALTY_COEF * wp.max(wp.abs(beta) - SLIP_THRESHOLD, 0.0)
+    # slip_pen = SLIP_PENALTY_COEF * wp.max(wp.abs(beta) - SLIP_THRESHOLD, 0.0)
 
     stalled_now = (forward_step < STALL_PROGRESS_THRESH) and (wp.abs(v_along) < STALL_V_THRESH)
     if stalled_now:
@@ -259,7 +259,7 @@ def step_kernel(
         - wall_pen
         - steer_pen
         - low_speed_steer_pen
-        - slip_pen
+        # - slip_pen
         - stuck_pen
     )
 
