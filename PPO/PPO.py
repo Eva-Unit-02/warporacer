@@ -276,12 +276,6 @@ def train(
                 print(f"[rollout {it + 1}] failed: {e}")
     return time.time() - t0, obs_rms, ret_rms, global_step
 
-
-
-
-
-
-
 # Rollout video
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     snap = env.save_state()

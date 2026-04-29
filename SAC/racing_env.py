@@ -218,7 +218,6 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
-    # Reward calculation
     cth = centerline[new_wp][2]
     v_along = v * wp.cos(beta + psi - cth)
     progress = (
