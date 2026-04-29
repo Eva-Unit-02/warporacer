@@ -234,7 +234,9 @@ def step_kernel(
         0.0,
     )
     back_pen = BACKWARD_PENALTY_COEF * wp.max(-v_along, 0.0)
-    reward[i] = progress + term_pen - slow_pen - back_pen
+    wall_pen = WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
+    steer_pen = STEER_PENALTY_COEF * (wp.abs(steer_v) / STEER_V_MAX)
+    reward[i] = progress + term_pen - slow_pen - back_pen - wall_pen - steer_pen
 
     if term:
         done[i] = DONE_TERMINATED
