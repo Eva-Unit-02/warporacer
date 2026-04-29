@@ -228,7 +228,10 @@ def step_kernel(
     )
 
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+
+    # Penalize sharp steer
+    slip_pen = SLIP_PENALTY_COEF * wp.max(wp.abs(beta) - SLIP_THRESHOLD, 0.0)
+    reward[i] = progress + term_pen - slip_pen
 
     if term:
         done[i] = DONE_TERMINATED
