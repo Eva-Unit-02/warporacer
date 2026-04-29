@@ -158,6 +158,7 @@ def step_kernel(
     beta = cars[i, 6]
     steps = cars_int[i, 0]
     wp_i = cars_int[i, 1]
+    stall_steps = cars_int[i, 2]
     mu_s = car_dr[i, 0]
     mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
@@ -175,6 +176,9 @@ def step_kernel(
     if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
         accel = 0.0
 
+    x_prev = x
+    y_prev = y
+    cth_prev = centerline[wp_i][2]
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
         d = rk4_step(
@@ -208,26 +212,19 @@ def step_kernel(
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     edt_val = dt_map[px, py] * res
     term = edt_val < CAR_HALF_DIAG
-    trunc = steps >= MAX_STEPS
     steps += 1
 
     new_wp = cl_lut[px, py]
-    d_wp = new_wp - wp_i
-    if 2 * d_wp > n_cl:
-        d_wp -= n_cl
-    elif 2 * d_wp < -n_cl:
-        d_wp += n_cl
-
     cth = centerline[new_wp][2]
+    dx = x - x_prev
+    dy = y - y_prev
+    forward_step = dx * wp.cos(cth_prev) + dy * wp.sin(cth_prev)
     v_along = v * wp.cos(beta + psi - cth)
-    progress = (
-        wp.float32(d_wp)
-        / wp.float32(n_cl)
-        * PROGRESS_SCALE
-        * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
-    )
+    progress_reward = PROGRESS_REWARD_COEF * forward_step
+    speed_reward = FORWARD_SPEED_REWARD_COEF * wp.max(v_along, 0.0)
 
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
+    step_pen = STEP_PENALTY
     slow_pen = wp.where(
         v_along < SLOW_V_ALONG_THRESH,
         SLOW_PROGRESS_PENALTY * (SLOW_V_ALONG_THRESH - v_along),
@@ -236,7 +233,35 @@ def step_kernel(
     back_pen = BACKWARD_PENALTY_COEF * wp.max(-v_along, 0.0)
     wall_pen = WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
     steer_pen = STEER_PENALTY_COEF * (wp.abs(steer_v) / STEER_V_MAX)
-    reward[i] = progress + term_pen - slow_pen - back_pen - wall_pen - steer_pen
+    low_speed_steer_pen = (
+        LOW_SPEED_STEER_PENALTY_COEF
+        * (wp.abs(steer_v) / STEER_V_MAX)
+        * wp.max(LOW_SPEED_STEER_V_THRESH - v_along, 0.0)
+    )
+    slip_pen = SLIP_PENALTY_COEF * wp.max(wp.abs(beta) - SLIP_THRESHOLD, 0.0)
+
+    stalled_now = (forward_step < STALL_PROGRESS_THRESH) and (wp.abs(v_along) < STALL_V_THRESH)
+    if stalled_now:
+        stall_steps += 1
+    else:
+        stall_steps = 0
+
+    stuck = stall_steps >= STALL_MAX_STEPS
+    trunc = (steps >= MAX_STEPS) or stuck
+    stuck_pen = wp.where(stuck, STALL_PENALTY, 0.0)
+    reward[i] = (
+        progress_reward
+        + speed_reward
+        + term_pen
+        - step_pen
+        - slow_pen
+        - back_pen
+        - wall_pen
+        - steer_pen
+        - low_speed_steer_pen
+        - slip_pen
+        - stuck_pen
+    )
 
     if term:
         done[i] = DONE_TERMINATED
@@ -258,6 +283,7 @@ def step_kernel(
         psip = 0.0
         beta = 0.0
         steps = 0
+        stall_steps = 0
         new_wp = rnd
         car_dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
@@ -326,6 +352,7 @@ def step_kernel(
     cars[i, 6] = beta
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
+    cars_int[i, 2] = stall_steps
 
 
 # Env
@@ -359,7 +386,7 @@ class RacingEnv:
         cars[:, 0] = self.map.centerline[idxs, 0]
         cars[:, 1] = self.map.centerline[idxs, 1]
         cars[:, 4] = self.map.angles[idxs]
-        cars_int = np.zeros((num_envs, 2), dtype=np.int32)
+        cars_int = np.zeros((num_envs, 3), dtype=np.int32)
         cars_int[:, 1] = idxs
         dr_init = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
