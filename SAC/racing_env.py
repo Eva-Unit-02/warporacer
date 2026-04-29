@@ -228,7 +228,13 @@ def step_kernel(
     )
 
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+    slow_pen = wp.where(
+        v_along < SLOW_V_ALONG_THRESH,
+        SLOW_PROGRESS_PENALTY * (SLOW_V_ALONG_THRESH - v_along),
+        0.0,
+    )
+    back_pen = BACKWARD_PENALTY_COEF * wp.max(-v_along, 0.0)
+    reward[i] = progress + term_pen - slow_pen - back_pen
 
     if term:
         done[i] = DONE_TERMINATED
