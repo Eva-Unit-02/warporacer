@@ -237,11 +237,11 @@ def step_kernel(
 
     # Penalize slow movement
     slow_pen = wp.where(
-        (v_along > 0.0) & (v_along < MIN_SPEED_THRESHOLD), 
+        (v_along > 0.0) and (v_along < MIN_SPEED_THRESHOLD), 
         SLOW_SPEED_PENALTY_COEF * (MIN_SPEED_THRESHOLD - v_along), 
         0.0
     )
-    
+
     reward[i] = progress + term_pen - slip_pen - backward_pen - slow_pen
 
     if term:
