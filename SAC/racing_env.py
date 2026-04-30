@@ -231,7 +231,18 @@ def step_kernel(
 
     # Penalize sharp steer
     slip_pen = SLIP_PENALTY_COEF * wp.max(wp.abs(beta) - SLIP_THRESHOLD, 0.0)
-    reward[i] = progress + term_pen - slip_pen
+
+    # Penalize backward movement
+    backward_pen = wp.where(v_along < 0.0, BACKWARD_PENALTY_COEF * wp.abs(v_along), 0.0)
+
+    # Penalize slow movement
+    slow_pen = wp.where(
+        (v_along > 0.0) & (v_along < MIN_SPEED_THRESHOLD), 
+        SLOW_SPEED_PENALTY_COEF * (MIN_SPEED_THRESHOLD - v_along), 
+        0.0
+    )
+    
+    reward[i] = progress + term_pen - slip_pen - backward_pen - slow_pen
 
     if term:
         done[i] = DONE_TERMINATED
