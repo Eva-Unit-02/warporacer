@@ -13,7 +13,7 @@ from sac import record_rollout, train
 
 def main(
     map_yaml: Path,
-    num_envs: int = 4096,
+    num_envs: int = 1024,
     iterations: int = 2000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
@@ -25,12 +25,12 @@ def main(
     gamma: float = 0.99,
     tau: float = 0.005,
     actor_lr: float = 3e-4,
-    critic_lr: float = 2e-4,
+    critic_lr: float = 1e-4,
     alpha_lr: float = 1e-3,
     policy_frequency: int = 2,
     autotune: bool = True,
     alpha: float = 0.2,
-    record_every: int = 100,
+    record_every: int = 200,
     record_steps: int = 1800,
     use_wandb: bool = True,
 ):

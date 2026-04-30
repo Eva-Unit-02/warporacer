@@ -70,7 +70,7 @@ class SoftQNetwork(nn.Module):
         super().__init__()
         self.fc1 = layer_init(nn.Linear(obs_dim + act_dim, hidden))
         self.fc2 = layer_init(nn.Linear(hidden, hidden))
-        self.fc3 = layer_init(nn.Linear(hidden, 1), std=1.0)
+        self.fc3 = layer_init(nn.Linear(hidden, 1), std=0.1)
 
     def forward(self, obs, action):
         x = torch.cat([obs, action], dim=-1)

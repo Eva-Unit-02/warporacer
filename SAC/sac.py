@@ -168,7 +168,7 @@ def train(
     target_network_frequency=1,
     updates_per_iter=0,
     autotune=True,
-    alpha=0.2,
+    alpha=0.1,
     log_dir=Path("./logs"),
     record_every=100,
     record_steps=1800,
