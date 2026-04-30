@@ -43,7 +43,8 @@ class ReplayBatch:
     next_observations: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
-    dones: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
 
 
 class ReplayBuffer:
@@ -54,23 +55,26 @@ class ReplayBuffer:
         self.next_obs = torch.empty((self.capacity, obs_dim), dtype=torch.float32)
         self.actions = torch.empty((self.capacity, act_dim), dtype=torch.float32)
         self.rewards = torch.empty((self.capacity, 1), dtype=torch.float32)
-        self.dones = torch.empty((self.capacity, 1), dtype=torch.float32)
+        self.terminated = torch.empty((self.capacity, 1), dtype=torch.float32)
+        self.truncated = torch.empty((self.capacity, 1), dtype=torch.float32)
         self.pos = 0
         self.size = 0
 
-    def add(self, obs, next_obs, actions, rewards, dones):
+    def add(self, obs, next_obs, actions, rewards, terminated, truncated):
         obs = obs.detach().to("cpu", dtype=torch.float32)
         next_obs = next_obs.detach().to("cpu", dtype=torch.float32)
         actions = actions.detach().to("cpu", dtype=torch.float32)
         rewards = rewards.detach().to("cpu", dtype=torch.float32).view(-1, 1)
-        dones = dones.detach().to("cpu", dtype=torch.float32).view(-1, 1)
+        terminated = terminated.detach().to("cpu", dtype=torch.float32).view(-1, 1)
+        truncated = truncated.detach().to("cpu", dtype=torch.float32).view(-1, 1)
 
         if obs.shape[0] > self.capacity:
             obs = obs[-self.capacity :]
             next_obs = next_obs[-self.capacity :]
             actions = actions[-self.capacity :]
             rewards = rewards[-self.capacity :]
-            dones = dones[-self.capacity :]
+            terminated = terminated[-self.capacity :]
+            truncated = truncated[-self.capacity :]
 
         n = obs.shape[0]
         idx = (torch.arange(n) + self.pos) % self.capacity
@@ -78,7 +82,8 @@ class ReplayBuffer:
         self.next_obs[idx] = next_obs
         self.actions[idx] = actions
         self.rewards[idx] = rewards
-        self.dones[idx] = dones
+        self.terminated[idx] = terminated
+        self.truncated[idx] = truncated
         self.pos = (self.pos + n) % self.capacity
         self.size = min(self.capacity, self.size + n)
 
@@ -89,7 +94,8 @@ class ReplayBuffer:
             next_observations=self.next_obs[idx].to(self.device),
             actions=self.actions[idx].to(self.device),
             rewards=self.rewards[idx].to(self.device),
-            dones=self.dones[idx].to(self.device),
+            terminated=self.terminated[idx].to(self.device),
+            truncated=self.truncated[idx].to(self.device),
         )
 
 
@@ -216,13 +222,14 @@ def train(
                 actions, _, _ = agent.sample_action(norm_obs)
 
         next_raw_obs, rewards, term, trunc, _ = env.step(actions)
-        dones = (term | trunc).float()
+        terminated = term.float()
+        truncated = trunc.float()
 
-        replay.add(raw_obs, next_raw_obs, actions, rewards, dones)
+        replay.add(raw_obs, next_raw_obs, actions, rewards, terminated, truncated)
 
         ep_ret.add_(rewards)
         ep_len.add_(1.0)
-        finished = dones.bool()
+        finished = (terminated > 0.0) | (truncated > 0.0)
         if finished.any():
             finished_rets.extend(ep_ret[finished].cpu().tolist())
             finished_lens.extend(ep_len[finished].cpu().tolist())
@@ -256,7 +263,10 @@ def train(
                     q1_next = agent.q1_target(next_obs, next_actions)
                     q2_next = agent.q2_target(next_obs, next_actions)
                     min_q_next = torch.min(q1_next, q2_next) - alpha_value * next_log_pi
-                    target_q = batch.rewards + (1.0 - batch.dones) * gamma * min_q_next
+                    discount_mask = 1.0 - torch.maximum(
+                        batch.terminated, batch.truncated
+                    )
+                    target_q = batch.rewards + discount_mask * gamma * min_q_next
 
                 q1_pred = agent.q1(obs, batch.actions)
                 q2_pred = agent.q2(obs, batch.actions)
@@ -271,6 +281,7 @@ def train(
                 update_step += 1
 
                 if update_step % policy_frequency == 0:
+                    agent.set_critics_grad(False)
                     pi, log_pi, _ = agent.sample_action(obs)
                     q1_pi = agent.q1(obs, pi)
                     q2_pi = agent.q2(obs, pi)
@@ -292,6 +303,8 @@ def train(
                         alpha_optimizer.step()
                         alpha_value = log_alpha.exp().detach()
                         stats["alpha_loss"] = alpha_loss.item()
+
+                    agent.set_critics_grad(True)
 
                     stats["actor_loss"] = actor_loss.item()
                     stats["log_pi"] = log_pi.mean().item()

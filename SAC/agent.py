@@ -104,6 +104,11 @@ class SACAgent(nn.Module):
         for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
             target_param.data.mul_(1.0 - tau).add_(param.data, alpha=tau)
 
+    def set_critics_grad(self, requires_grad: bool):
+        for critic in (self.q1, self.q2):
+            for param in critic.parameters():
+                param.requires_grad_(requires_grad)
+
     def sample_action(self, obs):
         return self.actor.sample(obs)
 

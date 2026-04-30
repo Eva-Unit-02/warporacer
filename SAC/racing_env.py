@@ -451,6 +451,7 @@ class RacingEnv:
             for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
         } | {
             "car_dr": wp.to_torch(self.car_dr).clone(),
+            "call": self._call,
         }
 
     def restore_state(self, s):
@@ -460,3 +461,4 @@ class RacingEnv:
         self.obs_buf.copy_(s["obs_buf"])
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
+        self._call = s["call"]
