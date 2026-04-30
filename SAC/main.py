@@ -29,7 +29,7 @@ def main(
     alpha_lr: float = 1e-3,
     policy_frequency: int = 2,
     autotune: bool = True,
-    alpha: float = 0.2,
+    alpha: float = 0.1,
     record_every: int = 200,
     record_steps: int = 1800,
     use_wandb: bool = True,
