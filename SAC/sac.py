@@ -191,7 +191,9 @@ def train(
 
     if autotune:
         target_entropy = -float(ACT_DIM)
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha = torch.tensor(
+            [np.log(alpha)], dtype=torch.float32, device=device, requires_grad=True
+        )
         alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
         alpha_value = log_alpha.exp().detach()
     else:
@@ -241,7 +243,7 @@ def train(
         raw_obs = next_raw_obs
         global_step += num_envs
 
-        gradient_steps = updates_per_iter or max(8, num_envs // max(batch_size, 1))
+        gradient_steps = max(1, updates_per_iter)
         stats = {
             "q1_loss": float("nan"),
             "q2_loss": float("nan"),
@@ -264,9 +266,7 @@ def train(
                     q1_next = agent.q1_target(next_obs, next_actions)
                     q2_next = agent.q2_target(next_obs, next_actions)
                     min_q_next = torch.min(q1_next, q2_next) - alpha_value * next_log_pi
-                    discount_mask = 1.0 - torch.maximum(
-                        batch.terminated, batch.truncated
-                    )
+                    discount_mask = 1.0 - batch.terminated
                     target_q = batch.rewards + discount_mask * gamma * min_q_next
 
                 q1_pred = agent.q1(obs, batch.actions)
@@ -295,11 +295,7 @@ def train(
                     actor_optimizer.step()
 
                     if autotune:
-                        with torch.no_grad():
-                            _, log_pi_alpha, _ = agent.sample_action(obs)
-                        alpha_loss = (
-                            -log_alpha.exp() * (log_pi_alpha + target_entropy)
-                        ).mean()
+                        alpha_loss = (-log_alpha * (log_pi.detach() + target_entropy)).mean()
                         alpha_optimizer.zero_grad(set_to_none=True)
                         alpha_loss.backward()
                         alpha_optimizer.step()
