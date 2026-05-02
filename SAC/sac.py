@@ -161,23 +161,23 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
-    buffer_size=250_000,
-    batch_size=1024,
-    gamma=0.99,
-    tau=0.005,
-    actor_lr=3e-4,
-    critic_lr=1e-3,
-    alpha_lr=1e-3,
-    learning_starts=20_000,
-    policy_frequency=2,
-    target_network_frequency=1,
-    updates_per_iter=0,
-    autotune=True,
-    alpha=0.2,
-    log_dir=Path("./logs"),
-    record_every=100,
-    record_steps=1800,
+    iterations,
+    buffer_size,
+    batch_size,
+    gamma,
+    tau,
+    actor_lr,
+    critic_lr,
+    alpha_lr,
+    learning_starts,
+    policy_frequency,
+    target_network_frequency, #decides how often target network for q network updates (copies of the current Q-networks that provide stable target values during training)
+    updates_per_iter,
+    autotune,
+    alpha,
+    log_dir,
+    record_every,
+    record_steps,
 ):
     device = next(agent.parameters()).device
     num_envs = env.num_envs
@@ -211,6 +211,7 @@ def train(
     t0 = time.time()
     last_t = t0
 
+    # TODO LEARN
     for it in range(iterations):
         with torch.no_grad():
             if global_step < learning_starts:
@@ -240,7 +241,7 @@ def train(
         raw_obs = next_raw_obs
         global_step += num_envs
 
-        gradient_steps = updates_per_iter or max(1, num_envs // max(batch_size, 1))
+        gradient_steps = updates_per_iter or max(8, num_envs // max(batch_size, 1))
         stats = {
             "q1_loss": float("nan"),
             "q2_loss": float("nan"),
@@ -277,6 +278,7 @@ def train(
                 critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 critic_optimizer.step()
+            
 
                 update_step += 1
 
