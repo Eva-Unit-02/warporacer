@@ -248,7 +248,7 @@ def step_kernel(
         progress
         + centerline_reward
         - backward_pen
-        - circle_pen
+        # - circle_pen
         + term_pen
     )
 
