@@ -20,7 +20,7 @@ def main(
     device: str = "",
     buffer_size: int = 250_000,
     batch_size: int = 256,
-    learning_starts: int = 20_000,
+    learning_starts: int = 80_000,
     updates_per_iter: int = 0,
     gamma: float = 0.99,
     tau: float = 0.005,
