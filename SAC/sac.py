@@ -190,8 +190,7 @@ def train(
     actor_optimizer = torch.optim.Adam(agent.actor.parameters(), lr=actor_lr)
 
     if autotune:
-        # target_entropy = -float(ACT_DIM)
-        target_entropy = -1.0 # Set value
+        target_entropy = -float(ACT_DIM)
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
         alpha_value = log_alpha.exp().detach()
@@ -312,7 +311,7 @@ def train(
                     stats["actor_loss"] = actor_loss.item()
                     stats["log_pi"] = log_pi.mean().item()
 
-                if update_step % target_network_frequency == 0:
+                if target_network_frequency <= 1 or update_step % target_network_frequency == 0:
                     agent.soft_update(tau)
 
                 stats["q1_loss"] = q1_loss.item()
