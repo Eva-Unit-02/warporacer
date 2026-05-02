@@ -14,7 +14,7 @@ from sac import record_rollout, train
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 8000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
@@ -31,7 +31,7 @@ def main(
     target_network_frequency: int = 500,
     autotune: bool = True,
     alpha: float = 0.2,
-    record_every: int = 200,
+    record_every: int = 800,
     record_steps: int = 1800,
     use_wandb: bool = True,
     torch_deterministic: bool = True,
