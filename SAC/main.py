@@ -28,7 +28,7 @@ def main(
     critic_lr: float = 1e-3,
     alpha_lr: float = 1e-3,
     policy_frequency: int = 1,
-    target_network_frequency: int = 500,
+    target_network_frequency: int = 50,
     autotune: bool = True,
     alpha: float = 0.2,
     record_every: int = 100,
