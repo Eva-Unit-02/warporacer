@@ -1,3 +1,4 @@
+from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -14,34 +15,40 @@ from sac import record_rollout, train
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 2000,
+    total_timesteps: int = 1_000_000,
+    iterations: int = 0,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
-    buffer_size: int = 250_000,
+    buffer_size: int = 1_000_000,
     batch_size: int = 256,
-    learning_starts: int = 80_000,
-    updates_per_iter: int = 0,
+    learning_starts: int = 5_000,
+    updates_per_iter: int = 1,
     gamma: float = 0.99,
     tau: float = 0.005,
     actor_lr: float = 3e-4,
     critic_lr: float = 1e-3,
     alpha_lr: float = 1e-3,
-    policy_frequency: int = 1,
-    target_network_frequency: int = 50,
-    autotune: bool = False,
+    policy_frequency: int = 2,
+    target_network_frequency: int = 1,
+    autotune: bool = True,
     alpha: float = 0.2,
     record_every: int = 100,
     record_steps: int = 1800,
     use_wandb: bool = True,
+    torch_deterministic: bool = True,
+    normalize_observations: bool = False,
 ):
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = torch_deterministic
+    torch.backends.cudnn.benchmark = not torch_deterministic
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    iterations = iterations or ceil(total_timesteps / max(num_envs, 1))
 
     env = RacingEnv(
         map_yaml,
@@ -60,6 +67,7 @@ def main(
                 config={
                     "algorithm": "SAC",
                     "num_envs": num_envs,
+                    "total_timesteps": total_timesteps,
                     "iterations": iterations,
                     "seed": seed,
                     "map": str(map_yaml),
@@ -76,6 +84,8 @@ def main(
                     "target_network_frequency": target_network_frequency,
                     "autotune": autotune,
                     "alpha": alpha,
+                    "torch_deterministic": torch_deterministic,
+                    "normalize_observations": normalize_observations,
                 },
             )
         except Exception as e:
@@ -101,15 +111,16 @@ def main(
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
+        normalize_observations=normalize_observations,
     )
     print(f"[done] {elapsed:.1f}s")
 
     torch.save(
         {
             "agent": agent.state_dict(),
-            "obs_mean": obs_rms.mean.cpu(),
-            "obs_var": obs_rms.var.cpu(),
-            "obs_count": obs_rms.count,
+            "obs_mean": obs_rms.mean.cpu() if obs_rms is not None else None,
+            "obs_var": obs_rms.var.cpu() if obs_rms is not None else None,
+            "obs_count": obs_rms.count if obs_rms is not None else None,
             "alpha": alpha_value,
             "log_alpha": log_alpha,
         },

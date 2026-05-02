@@ -43,8 +43,7 @@ class ReplayBatch:
     next_observations: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
-    terminated: torch.Tensor
-    truncated: torch.Tensor
+    dones: torch.Tensor
 
 
 class ReplayBuffer:
@@ -55,26 +54,23 @@ class ReplayBuffer:
         self.next_obs = torch.empty((self.capacity, obs_dim), dtype=torch.float32)
         self.actions = torch.empty((self.capacity, act_dim), dtype=torch.float32)
         self.rewards = torch.empty((self.capacity, 1), dtype=torch.float32)
-        self.terminated = torch.empty((self.capacity, 1), dtype=torch.float32)
-        self.truncated = torch.empty((self.capacity, 1), dtype=torch.float32)
+        self.dones = torch.empty((self.capacity, 1), dtype=torch.float32)
         self.pos = 0
         self.size = 0
 
-    def add(self, obs, next_obs, actions, rewards, terminated, truncated):
+    def add(self, obs, next_obs, actions, rewards, dones):
         obs = obs.detach().to("cpu", dtype=torch.float32)
         next_obs = next_obs.detach().to("cpu", dtype=torch.float32)
         actions = actions.detach().to("cpu", dtype=torch.float32)
         rewards = rewards.detach().to("cpu", dtype=torch.float32).view(-1, 1)
-        terminated = terminated.detach().to("cpu", dtype=torch.float32).view(-1, 1)
-        truncated = truncated.detach().to("cpu", dtype=torch.float32).view(-1, 1)
+        dones = dones.detach().to("cpu", dtype=torch.float32).view(-1, 1)
 
         if obs.shape[0] > self.capacity:
             obs = obs[-self.capacity :]
             next_obs = next_obs[-self.capacity :]
             actions = actions[-self.capacity :]
             rewards = rewards[-self.capacity :]
-            terminated = terminated[-self.capacity :]
-            truncated = truncated[-self.capacity :]
+            dones = dones[-self.capacity :]
 
         n = obs.shape[0]
         idx = (torch.arange(n) + self.pos) % self.capacity
@@ -82,8 +78,7 @@ class ReplayBuffer:
         self.next_obs[idx] = next_obs
         self.actions[idx] = actions
         self.rewards[idx] = rewards
-        self.terminated[idx] = terminated
-        self.truncated[idx] = truncated
+        self.dones[idx] = dones
         self.pos = (self.pos + n) % self.capacity
         self.size = min(self.capacity, self.size + n)
 
@@ -94,8 +89,7 @@ class ReplayBuffer:
             next_observations=self.next_obs[idx].to(self.device),
             actions=self.actions[idx].to(self.device),
             rewards=self.rewards[idx].to(self.device),
-            terminated=self.terminated[idx].to(self.device),
-            truncated=self.truncated[idx].to(self.device),
+            dones=self.dones[idx].to(self.device),
         )
 
 
@@ -178,10 +172,11 @@ def train(
     log_dir,
     record_every,
     record_steps,
+    normalize_observations,
 ):
     device = next(agent.parameters()).device
     num_envs = env.num_envs
-    obs_rms = RunningMeanStd((OBS_DIM,), device)
+    obs_rms = RunningMeanStd((OBS_DIM,), device) if normalize_observations else None
     replay = ReplayBuffer(buffer_size, OBS_DIM, ACT_DIM, device)
 
     critic_optimizer = torch.optim.Adam(
@@ -190,8 +185,7 @@ def train(
     actor_optimizer = torch.optim.Adam(agent.actor.parameters(), lr=actor_lr)
 
     if autotune:
-        # target_entropy = -float(ACT_DIM)
-        target_entropy = -1.0 # Set value
+        target_entropy = -float(np.prod(env.action_space.shape))
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
         alpha_value = log_alpha.exp().detach()
@@ -202,17 +196,16 @@ def train(
         alpha_value = torch.tensor(alpha, dtype=torch.float32, device=device)
 
     raw_obs, _ = env.reset()
-    obs_rms.update(raw_obs)
+    if obs_rms is not None:
+        obs_rms.update(raw_obs)
     ep_ret = torch.zeros(num_envs, device=device)
     ep_len = torch.zeros(num_envs, device=device)
     finished_rets, finished_lens = deque(maxlen=100), deque(maxlen=100)
 
     global_step = 0
-    update_step = 0
+    env_step = 0
     t0 = time.time()
-    last_t = t0
 
-    # TODO LEARN
     for it in range(iterations):
         with torch.no_grad():
             if global_step < learning_starts:
@@ -220,14 +213,20 @@ def train(
                     -1.0, 1.0
                 )
             else:
-                norm_obs = obs_rms.normalize(raw_obs)
+                norm_obs = obs_rms.normalize(raw_obs) if obs_rms is not None else raw_obs
                 actions, _, _ = agent.sample_action(norm_obs)
 
-        next_raw_obs, rewards, term, trunc, _ = env.step(actions)
+        next_raw_obs, rewards, term, trunc, infos = env.step(actions)
         terminated = term.float()
         truncated = trunc.float()
+        real_next_obs = next_raw_obs.clone()
+        final_observation = infos.get("final_observation")
+        if final_observation is not None:
+            trunc_idx = torch.nonzero(trunc, as_tuple=False).flatten()
+            if trunc_idx.numel() > 0:
+                real_next_obs[trunc_idx] = final_observation[trunc_idx]
 
-        replay.add(raw_obs, next_raw_obs, actions, rewards, terminated, truncated)
+        replay.add(raw_obs, real_next_obs, actions, rewards, terminated)
 
         ep_ret.add_(rewards)
         ep_len.add_(1.0)
@@ -238,11 +237,13 @@ def train(
             ep_ret[finished] = 0.0
             ep_len[finished] = 0.0
 
-        obs_rms.update(next_raw_obs)
+        if obs_rms is not None:
+            obs_rms.update(next_raw_obs)
         raw_obs = next_raw_obs
         global_step += num_envs
+        env_step += 1
 
-        gradient_steps = updates_per_iter or max(8, num_envs // max(batch_size, 1))
+        gradient_steps = updates_per_iter if updates_per_iter > 0 else 1
         stats = {
             "q1_loss": float("nan"),
             "q2_loss": float("nan"),
@@ -254,21 +255,26 @@ def train(
             "log_pi": float("nan"),
         }
 
-        if global_step >= learning_starts and replay.size >= batch_size:
+        if global_step > learning_starts and replay.size >= batch_size:
             for _ in range(gradient_steps):
                 batch = replay.sample(batch_size)
-                obs = obs_rms.normalize(batch.observations)
-                next_obs = obs_rms.normalize(batch.next_observations)
+                obs = (
+                    obs_rms.normalize(batch.observations)
+                    if obs_rms is not None
+                    else batch.observations
+                )
+                next_obs = (
+                    obs_rms.normalize(batch.next_observations)
+                    if obs_rms is not None
+                    else batch.next_observations
+                )
 
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = agent.sample_action(next_obs)
                     q1_next = agent.q1_target(next_obs, next_actions)
                     q2_next = agent.q2_target(next_obs, next_actions)
                     min_q_next = torch.min(q1_next, q2_next) - alpha_value * next_log_pi
-                    discount_mask = 1.0 - torch.maximum(
-                        batch.terminated, batch.truncated
-                    )
-                    target_q = batch.rewards + discount_mask * gamma * min_q_next
+                    target_q = batch.rewards + (1.0 - batch.dones) * gamma * min_q_next
 
                 q1_pred = agent.q1(obs, batch.actions)
                 q2_pred = agent.q2(obs, batch.actions)
@@ -279,40 +285,37 @@ def train(
                 critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 critic_optimizer.step()
-            
 
-                update_step += 1
+                if env_step % policy_frequency == 0:
+                    for _ in range(policy_frequency):
+                        agent.set_critics_grad(False)
+                        pi, log_pi, _ = agent.sample_action(obs)
+                        q1_pi = agent.q1(obs, pi)
+                        q2_pi = agent.q2(obs, pi)
+                        min_q_pi = torch.min(q1_pi, q2_pi)
+                        actor_loss = (alpha_value * log_pi - min_q_pi).mean()
 
-                if update_step % policy_frequency == 0:
-                    agent.set_critics_grad(False)
-                    pi, log_pi, _ = agent.sample_action(obs)
-                    q1_pi = agent.q1(obs, pi)
-                    q2_pi = agent.q2(obs, pi)
-                    min_q_pi = torch.min(q1_pi, q2_pi)
-                    actor_loss = (alpha_value * log_pi - min_q_pi).mean()
+                        actor_optimizer.zero_grad(set_to_none=True)
+                        actor_loss.backward()
+                        actor_optimizer.step()
 
-                    actor_optimizer.zero_grad(set_to_none=True)
-                    actor_loss.backward()
-                    actor_optimizer.step()
+                        if autotune:
+                            with torch.no_grad():
+                                _, log_pi_alpha, _ = agent.sample_action(obs)
+                            alpha_loss = (
+                                -log_alpha.exp() * (log_pi_alpha + target_entropy)
+                            ).mean()
+                            alpha_optimizer.zero_grad(set_to_none=True)
+                            alpha_loss.backward()
+                            alpha_optimizer.step()
+                            alpha_value = log_alpha.exp().detach()
+                            stats["alpha_loss"] = alpha_loss.item()
 
-                    if autotune:
-                        with torch.no_grad():
-                            _, log_pi_alpha, _ = agent.sample_action(obs)
-                        alpha_loss = (
-                            -log_alpha.exp() * (log_pi_alpha + target_entropy)
-                        ).mean()
-                        alpha_optimizer.zero_grad(set_to_none=True)
-                        alpha_loss.backward()
-                        alpha_optimizer.step()
-                        alpha_value = log_alpha.exp().detach()
-                        stats["alpha_loss"] = alpha_loss.item()
+                        agent.set_critics_grad(True)
+                        stats["actor_loss"] = actor_loss.item()
+                        stats["log_pi"] = log_pi.mean().item()
 
-                    agent.set_critics_grad(True)
-
-                    stats["actor_loss"] = actor_loss.item()
-                    stats["log_pi"] = log_pi.mean().item()
-
-                if update_step % target_network_frequency == 0:
+                if env_step % target_network_frequency == 0:
                     agent.soft_update(tau)
 
                 stats["q1_loss"] = q1_loss.item()
@@ -322,8 +325,7 @@ def train(
                 stats["q2"] = q2_pred.mean().item()
 
         now = time.time()
-        sps = int(num_envs / max(now - last_t, 1e-9))
-        last_t = now
+        sps = int(global_step / max(now - t0, 1e-9))
         log = {
             "critic_loss": stats["critic_loss"],
             "q1_loss": stats["q1_loss"],

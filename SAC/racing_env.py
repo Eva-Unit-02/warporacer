@@ -133,6 +133,7 @@ def rk4_step(
 def step_kernel(
     actions: wp.array(dtype=wp.vec2),
     obs: wp.array2d(dtype=wp.float32),
+    final_obs: wp.array2d(dtype=wp.float32),
     reward: wp.array(dtype=wp.float32),
     done: wp.array(dtype=wp.int32),
     cars: wp.array2d(dtype=wp.float32),
@@ -236,6 +237,59 @@ def step_kernel(
         done[i] = DONE_TRUNCATED
     else:
         done[i] = 0
+
+    if term or trunc:
+        sh = wp.sin(psi)
+        ch = wp.cos(psi)
+        lx = x + LF * ch
+        ly = y + LF * sh
+        lpx = wp.clamp(wp.int32((lx - origin[0]) / res), 0, mw - 1)
+        lpy = wp.clamp(wp.int32(mh_f - (ly - origin[1]) / res), 0, mh - 1)
+        lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
+        lrange_px = LIDAR_RANGE / res
+        for j in range(lidar_dirs.shape[0]):
+            ca = lidar_dirs[j][0]
+            sa = lidar_dirs[j][1]
+            dpx = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
+            ray = lpos
+            dist = float(0.0)
+            while dist < lrange_px:
+                rx = wp.int32(ray[0])
+                ry = wp.int32(ray[1])
+                if rx < 0 or rx >= mw or ry < 0 or ry >= mh:
+                    break
+                step_px = dt_map[rx, ry]
+                ray = ray + dpx * step_px
+                dist += step_px
+                if step_px == 0.0:
+                    break
+            final_obs[i, 3 + j] = wp.min(dist, lrange_px) * res
+
+        cpt = centerline[new_wp]
+        cx_p = cpt[0]
+        cy_p = cpt[1]
+        cth_p = cpt[2]
+        s_cth = wp.sin(cth_p)
+        c_cth = wp.cos(cth_p)
+        heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
+        lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
+        final_obs[i, OBS_FRENET_OFF] = heading_err
+        final_obs[i, OBS_FRENET_OFF + 1] = lateral_err
+
+        idx = new_wp
+        for k in range(NUM_LOOKAHEAD):
+            idx += look_step
+            if idx >= n_cl:
+                idx -= n_cl
+            w = centerline[idx]
+            dx = w[0] - x
+            dy = w[1] - y
+            final_obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
+            final_obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
+
+        final_obs[i, 0] = delta
+        final_obs[i, 1] = v
+        final_obs[i, 2] = psip
 
     # Reset
     if term or trunc:
@@ -361,10 +415,12 @@ class RacingEnv:
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
         self.car_dr = wp.array(dr_init, dtype=float, device=d)
         self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
+        self.final_obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
         self.rew = wp.zeros(num_envs, dtype=float, device=d)
         self.done = wp.zeros(num_envs, dtype=int, device=d)
 
         self.obs_buf = wp.to_torch(self.obs)
+        self.final_obs_buf = wp.to_torch(self.final_obs)
         self.rew_buf = wp.to_torch(self.rew)
         self.done_buf = wp.to_torch(self.done)
         self.cars_buf = wp.to_torch(self.cars)
@@ -394,6 +450,7 @@ class RacingEnv:
             inputs=[
                 act,
                 self.obs,
+                self.final_obs,
                 self.rew,
                 self.done,
                 self.cars,
@@ -420,6 +477,7 @@ class RacingEnv:
         if not bad.any():
             return
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
+        torch.nan_to_num_(self.final_obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
         self._step_counter[bad] = MAX_STEPS
@@ -437,18 +495,28 @@ class RacingEnv:
     def step(self, action):
         self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
+        infos = {}
+        if (self.done_buf != 0).any():
+            infos["final_observation"] = self.final_obs_buf.clone()
         return (
             self.obs_buf,
             self.rew_buf,
             self.done_buf == DONE_TERMINATED,
             self.done_buf == DONE_TRUNCATED,
-            {},
+            infos,
         )
 
     def save_state(self):
         return {
             k: getattr(self, k).clone()
-            for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
+            for k in (
+                "cars_buf",
+                "cars_int_buf",
+                "obs_buf",
+                "final_obs_buf",
+                "rew_buf",
+                "done_buf",
+            )
         } | {
             "car_dr": wp.to_torch(self.car_dr).clone(),
             "call": self._call,
@@ -459,6 +527,7 @@ class RacingEnv:
         self.cars_int_buf.copy_(s["cars_int_buf"])
         wp.to_torch(self.car_dr).copy_(s["car_dr"])
         self.obs_buf.copy_(s["obs_buf"])
+        self.final_obs_buf.copy_(s["final_obs_buf"])
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
         self._call = s["call"]
