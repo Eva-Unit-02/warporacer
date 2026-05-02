@@ -228,8 +228,15 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
+    backward_pen = BACKWARD_PENALTY_COEF * wp.max(
+        -v_along - BACKWARD_SPEED_THRESH, 0.0
+    )
+    turn_rate = wp.abs(v * wp.tan(delta) / LWB)
+    circle_pen = CIRCLE_PENALTY_COEF * wp.max(
+        turn_rate - CIRCLE_TURN_RATE_THRESH, 0.0
+    ) * wp.max(CIRCLE_FORWARD_SPEED_THRESH - wp.max(v_along, 0.0), 0.0)
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+    reward[i] = progress - backward_pen - circle_pen + term_pen
 
     if term:
         done[i] = DONE_TERMINATED
