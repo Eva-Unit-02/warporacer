@@ -246,9 +246,9 @@ def step_kernel(
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = (
         progress
-        + centerline_reward
-        - backward_pen
-        - circle_pen
+        # + centerline_reward
+        # - backward_pen
+        # - circle_pen
         + term_pen
     )
 
