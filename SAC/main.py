@@ -14,7 +14,7 @@ from sac import record_rollout, train
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 200,
+    iterations: int = 2000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
