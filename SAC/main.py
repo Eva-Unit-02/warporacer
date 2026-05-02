@@ -1,4 +1,3 @@
-from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -15,8 +14,7 @@ from sac import record_rollout, train
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    total_timesteps: int = 1_000_000,
-    iterations: int = 0,
+    iterations: int = 200,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
@@ -48,8 +46,6 @@ def main(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    iterations = iterations or ceil(total_timesteps / max(num_envs, 1))
-
     env = RacingEnv(
         map_yaml,
         num_envs=num_envs,
@@ -67,7 +63,6 @@ def main(
                 config={
                     "algorithm": "SAC",
                     "num_envs": num_envs,
-                    "total_timesteps": total_timesteps,
                     "iterations": iterations,
                     "seed": seed,
                     "map": str(map_yaml),
