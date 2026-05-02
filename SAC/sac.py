@@ -190,7 +190,8 @@ def train(
     actor_optimizer = torch.optim.Adam(agent.actor.parameters(), lr=actor_lr)
 
     if autotune:
-        target_entropy = -float(ACT_DIM)
+        # target_entropy = -float(ACT_DIM)
+        target_entropy = -1.0 # Set value
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
         alpha_value = log_alpha.exp().detach()

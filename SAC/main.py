@@ -19,7 +19,7 @@ def main(
     log_dir: Path = Path("./logs"),
     device: str = "",
     buffer_size: int = 250_000,
-    batch_size: int = 1024,
+    batch_size: int = 64,
     learning_starts: int = 20_000,
     updates_per_iter: int = 0,
     gamma: float = 0.99,
