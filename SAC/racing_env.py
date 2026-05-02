@@ -220,7 +220,12 @@ def step_kernel(
         d_wp += n_cl
 
     cth = centerline[new_wp][2]
+    cx_p = centerline[new_wp][0]
+    cy_p = centerline[new_wp][1]
+    s_cth = wp.sin(cth)
+    c_cth = wp.cos(cth)
     v_along = v * wp.cos(beta + psi - cth)
+    lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
     progress = (
         wp.float32(d_wp)
         / wp.float32(n_cl)
@@ -228,6 +233,9 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
+    centerline_reward = CENTERLINE_REWARD_COEF * wp.max(
+        1.0 - wp.abs(lateral_err) / CENTERLINE_REWARD_WINDOW, 0.0
+    )
     backward_pen = BACKWARD_PENALTY_COEF * wp.max(
         -v_along - BACKWARD_SPEED_THRESH, 0.0
     )
@@ -236,7 +244,13 @@ def step_kernel(
         turn_rate - CIRCLE_TURN_RATE_THRESH, 0.0
     ) * wp.max(CIRCLE_FORWARD_SPEED_THRESH - wp.max(v_along, 0.0), 0.0)
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress - backward_pen - circle_pen + term_pen
+    reward[i] = (
+        progress
+        + centerline_reward
+        - backward_pen
+        - circle_pen
+        + term_pen
+    )
 
     if term:
         done[i] = DONE_TERMINATED
