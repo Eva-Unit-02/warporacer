@@ -215,10 +215,13 @@ def train(
                 norm_obs = obs_rms.normalize(raw_obs)
                 actions, _, _ = agent.sample_action(norm_obs)
 
-        next_raw_obs, rewards, term, trunc, _ = env.step(actions)
-        dones = (term | trunc).float()
+        next_raw_obs, rewards, term, trunc, info = env.step(actions)
+        real_next_raw_obs = next_raw_obs.clone()
+        if trunc.any():
+            real_next_raw_obs[trunc] = info["final_observation"][trunc]
+        dones = term.float()
 
-        replay.add(raw_obs, next_raw_obs, actions, rewards, dones)
+        replay.add(raw_obs, real_next_raw_obs, actions, rewards, dones)
 
         ep_ret.add_(rewards)
         ep_len.add_(1.0)
@@ -229,7 +232,7 @@ def train(
             ep_ret[finished] = 0.0
             ep_len[finished] = 0.0
 
-        obs_rms.update(next_raw_obs)
+        obs_rms.update(real_next_raw_obs)
         raw_obs = next_raw_obs
         global_step += num_envs
 
