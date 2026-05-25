@@ -21,7 +21,7 @@ def main(
     buffer_size: int = 2_000_000,
     batch_size: int = 1024,
     learning_starts: int = 200_000,
-    updates_per_iter: int = 8,
+    updates_per_iter: int = 1024,
     gamma: float = 0.991,
     tau: float = 0.005,
     actor_lr: float = 1e-4,
