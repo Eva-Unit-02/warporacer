@@ -1,14 +1,14 @@
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-import time
 
-from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
+from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 
 from config import *
 
@@ -22,18 +22,20 @@ class RunningMeanStd:
 
     def update(self, x):
         x = x.reshape(-1, *self.mean.shape).float()
-        bv, bm = torch.var_mean(x, dim=0, unbiased=False)
-        bc = x.shape[0]
-        delta = bm - self.mean
-        tot = self.count + bc
-        self.mean.add_(delta, alpha=bc / tot)
+        batch_var, batch_mean = torch.var_mean(x, dim=0, unbiased=False)
+        batch_count = x.shape[0]
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        self.mean.add_(delta, alpha=batch_count / total)
         self.var = (
-            self.var * self.count + bv * bc + delta * delta * (self.count * bc / tot)
-        ) / tot
-        self.count = tot
+            self.var * self.count
+            + batch_var * batch_count
+            + delta * delta * (self.count * batch_count / total)
+        ) / total
+        self.count = total
         self.inv_std = torch.rsqrt(self.var + 1e-8)
 
-    def normalize(self, x, clip: float = 10.0):
+    def normalize(self, x, clip=10.0):
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
 
@@ -47,23 +49,34 @@ class ReplayBatch:
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, obs_dim, act_dim, device):
+    def __init__(self, capacity, obs_dim, act_dim, storage_device, sample_device):
         self.capacity = int(capacity)
-        self.device = device
-        self.obs = torch.empty((self.capacity, obs_dim), dtype=torch.float32)
-        self.next_obs = torch.empty((self.capacity, obs_dim), dtype=torch.float32)
-        self.actions = torch.empty((self.capacity, act_dim), dtype=torch.float32)
-        self.rewards = torch.empty((self.capacity, 1), dtype=torch.float32)
-        self.dones = torch.empty((self.capacity, 1), dtype=torch.float32)
+        self.storage_device = torch.device(storage_device)
+        self.sample_device = torch.device(sample_device)
+        self.obs = torch.empty(
+            (self.capacity, obs_dim), dtype=torch.float32, device=self.storage_device
+        )
+        self.next_obs = torch.empty(
+            (self.capacity, obs_dim), dtype=torch.float32, device=self.storage_device
+        )
+        self.actions = torch.empty(
+            (self.capacity, act_dim), dtype=torch.float32, device=self.storage_device
+        )
+        self.rewards = torch.empty(
+            (self.capacity, 1), dtype=torch.float32, device=self.storage_device
+        )
+        self.dones = torch.empty(
+            (self.capacity, 1), dtype=torch.float32, device=self.storage_device
+        )
         self.pos = 0
         self.size = 0
 
     def add(self, obs, next_obs, actions, rewards, dones):
-        obs = obs.detach().to("cpu", dtype=torch.float32)
-        next_obs = next_obs.detach().to("cpu", dtype=torch.float32)
-        actions = actions.detach().to("cpu", dtype=torch.float32)
-        rewards = rewards.detach().to("cpu", dtype=torch.float32).view(-1, 1)
-        dones = dones.detach().to("cpu", dtype=torch.float32).view(-1, 1)
+        obs = obs.detach().to(self.storage_device, dtype=torch.float32)
+        next_obs = next_obs.detach().to(self.storage_device, dtype=torch.float32)
+        actions = actions.detach().to(self.storage_device, dtype=torch.float32)
+        rewards = rewards.detach().to(self.storage_device, dtype=torch.float32).view(-1, 1)
+        dones = dones.detach().to(self.storage_device, dtype=torch.float32).view(-1, 1)
 
         if obs.shape[0] > self.capacity:
             obs = obs[-self.capacity :]
@@ -72,28 +85,28 @@ class ReplayBuffer:
             rewards = rewards[-self.capacity :]
             dones = dones[-self.capacity :]
 
-        n = obs.shape[0]
-        idx = (torch.arange(n) + self.pos) % self.capacity
+        count = obs.shape[0]
+        idx = (torch.arange(count, device=self.storage_device) + self.pos) % self.capacity
         self.obs[idx] = obs
         self.next_obs[idx] = next_obs
         self.actions[idx] = actions
         self.rewards[idx] = rewards
         self.dones[idx] = dones
-        self.pos = (self.pos + n) % self.capacity
-        self.size = min(self.capacity, self.size + n)
+        self.pos = (self.pos + count) % self.capacity
+        self.size = min(self.capacity, self.size + count)
 
     def sample(self, batch_size):
-        idx = torch.randint(self.size, (batch_size,))
+        idx = torch.randint(self.size, (batch_size,), device=self.storage_device)
         return ReplayBatch(
-            observations=self.obs[idx].to(self.device),
-            next_observations=self.next_obs[idx].to(self.device),
-            actions=self.actions[idx].to(self.device),
-            rewards=self.rewards[idx].to(self.device),
-            dones=self.dones[idx].to(self.device),
+            observations=self.obs[idx].to(self.sample_device),
+            next_observations=self.next_obs[idx].to(self.sample_device),
+            actions=self.actions[idx].to(self.sample_device),
+            rewards=self.rewards[idx].to(self.sample_device),
+            dones=self.dones[idx].to(self.sample_device),
         )
 
 
-def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
+def record_rollout(env, agent, num_steps, out_path, obs_rms=None, obs_clip=10.0):
     snap = env.save_state()
     actor_was_training = agent.actor.training
     agent.actor.eval()
@@ -113,7 +126,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 
         trail = deque(maxlen=300)
         raw, _ = env.reset()
-        obs = obs_rms.normalize(raw) if obs_rms else raw
+        obs = obs_rms.normalize(raw, clip=obs_clip) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with imageio.get_writer(
             str(out_path), fps=int(1 / DT), macro_block_size=1
@@ -122,7 +135,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
                 for _ in range(num_steps):
                     action = agent.deterministic(obs)
                     raw, _, term, trunc, _ = env.step(action)
-                    obs = obs_rms.normalize(raw) if obs_rms else raw
+                    obs = obs_rms.normalize(raw, clip=obs_clip) if obs_rms else raw
                     row = env.cars_buf[0].tolist()
                     x, y, psi = row[0], row[1], row[4]
                     if bool(term[0].item()) or bool(trunc[0].item()):
@@ -155,28 +168,37 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 def train(
     env,
     agent,
-    iterations=2000,
+    total_timesteps=1_000_000,
     buffer_size=250_000,
-    batch_size=1024,
+    batch_size=256,
+    learning_starts=25_000,
     gamma=0.99,
     tau=0.005,
     actor_lr=3e-4,
     critic_lr=1e-3,
     alpha_lr=1e-3,
-    learning_starts=20_000,
     policy_frequency=2,
     target_network_frequency=1,
-    updates_per_iter=0,
+    updates_per_iter=2,
     autotune=True,
     alpha=0.2,
+    obs_clip=10.0,
+    replay_device=None,
     log_dir=Path("./logs"),
     record_every=100,
     record_steps=1800,
 ):
-    device = next(agent.parameters()).device
+    train_device = next(agent.parameters()).device
+    replay_device = replay_device or train_device
     num_envs = env.num_envs
-    obs_rms = RunningMeanStd((OBS_DIM,), device)
-    replay = ReplayBuffer(buffer_size, OBS_DIM, ACT_DIM, device)
+    obs_rms = RunningMeanStd((OBS_DIM,), train_device)
+    replay = ReplayBuffer(
+        buffer_size,
+        OBS_DIM,
+        ACT_DIM,
+        storage_device=replay_device,
+        sample_device=train_device,
+    )
 
     critic_optimizer = torch.optim.Adam(
         list(agent.q1.parameters()) + list(agent.q2.parameters()), lr=critic_lr
@@ -185,58 +207,54 @@ def train(
 
     if autotune:
         target_entropy = -float(ACT_DIM)
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        log_alpha = torch.zeros(1, requires_grad=True, device=train_device)
         alpha_optimizer = torch.optim.Adam([log_alpha], lr=alpha_lr)
         alpha_value = log_alpha.exp().detach()
     else:
         target_entropy = None
         log_alpha = None
         alpha_optimizer = None
-        alpha_value = torch.tensor(alpha, dtype=torch.float32, device=device)
+        alpha_value = torch.tensor(alpha, dtype=torch.float32, device=train_device)
 
     raw_obs, _ = env.reset()
     obs_rms.update(raw_obs)
-    ep_ret = torch.zeros(num_envs, device=device)
-    ep_len = torch.zeros(num_envs, device=device)
+    ep_ret = torch.zeros(num_envs, dtype=torch.float32, device=train_device)
+    ep_len = torch.zeros(num_envs, dtype=torch.float32, device=train_device)
     finished_rets, finished_lens = deque(maxlen=100), deque(maxlen=100)
 
     global_step = 0
     update_step = 0
-    t0 = time.time()
-    last_t = t0
+    iteration = 0
+    start_time = time.time()
 
-    for it in range(iterations):
+    while global_step < total_timesteps:
         with torch.no_grad():
             if global_step < learning_starts:
-                actions = torch.empty((num_envs, ACT_DIM), device=device).uniform_(
+                actions = torch.empty((num_envs, ACT_DIM), device=train_device).uniform_(
                     -1.0, 1.0
                 )
             else:
-                norm_obs = obs_rms.normalize(raw_obs)
+                norm_obs = obs_rms.normalize(raw_obs, clip=obs_clip)
                 actions, _, _ = agent.sample_action(norm_obs)
 
-        next_raw_obs, rewards, term, trunc, info = env.step(actions)
-        real_next_raw_obs = next_raw_obs.clone()
-        if trunc.any():
-            real_next_raw_obs[trunc] = info["final_observation"][trunc]
-        dones = term.float()
-
-        replay.add(raw_obs, real_next_raw_obs, actions, rewards, dones)
+        next_raw_obs, rewards, term, trunc, _ = env.step(actions)
+        dones = (term | trunc).float()
+        replay.add(raw_obs, next_raw_obs, actions, rewards, dones)
 
         ep_ret.add_(rewards)
         ep_len.add_(1.0)
         finished = dones.bool()
         if finished.any():
-            finished_rets.extend(ep_ret[finished].cpu().tolist())
-            finished_lens.extend(ep_len[finished].cpu().tolist())
+            finished_rets.extend(ep_ret[finished].detach().cpu().tolist())
+            finished_lens.extend(ep_len[finished].detach().cpu().tolist())
             ep_ret[finished] = 0.0
             ep_len[finished] = 0.0
 
-        obs_rms.update(real_next_raw_obs)
+        obs_rms.update(next_raw_obs)
         raw_obs = next_raw_obs
         global_step += num_envs
+        iteration += 1
 
-        gradient_steps = updates_per_iter or max(1, num_envs // max(batch_size, 1))
         stats = {
             "q1_loss": float("nan"),
             "q2_loss": float("nan"),
@@ -245,14 +263,15 @@ def train(
             "alpha_loss": float("nan"),
             "q1": float("nan"),
             "q2": float("nan"),
+            "target_q": float("nan"),
             "log_pi": float("nan"),
         }
 
         if global_step >= learning_starts and replay.size >= batch_size:
-            for _ in range(gradient_steps):
+            for _ in range(updates_per_iter):
                 batch = replay.sample(batch_size)
-                obs = obs_rms.normalize(batch.observations)
-                next_obs = obs_rms.normalize(batch.next_observations)
+                obs = obs_rms.normalize(batch.observations, clip=obs_clip)
+                next_obs = obs_rms.normalize(batch.next_observations, clip=obs_clip)
 
                 with torch.no_grad():
                     next_actions, next_log_pi, _ = agent.sample_action(next_obs)
@@ -284,6 +303,9 @@ def train(
                     actor_loss.backward()
                     actor_optimizer.step()
 
+                    stats["actor_loss"] = actor_loss.item()
+                    stats["log_pi"] = log_pi.mean().item()
+
                     if autotune:
                         with torch.no_grad():
                             _, log_pi_alpha, _ = agent.sample_action(obs)
@@ -296,62 +318,57 @@ def train(
                         alpha_value = log_alpha.exp().detach()
                         stats["alpha_loss"] = alpha_loss.item()
 
-                    stats["actor_loss"] = actor_loss.item()
-                    stats["log_pi"] = log_pi.mean().item()
-
                 if update_step % target_network_frequency == 0:
                     agent.soft_update(tau)
 
                 stats["q1_loss"] = q1_loss.item()
                 stats["q2_loss"] = q2_loss.item()
-                stats["critic_loss"] = critic_loss.item() * 0.5
+                stats["critic_loss"] = 0.5 * critic_loss.item()
                 stats["q1"] = q1_pred.mean().item()
                 stats["q2"] = q2_pred.mean().item()
+                stats["target_q"] = target_q.mean().item()
 
-        now = time.time()
-        sps = int(num_envs / max(now - last_t, 1e-9))
-        last_t = now
+        elapsed = max(time.time() - start_time, 1e-9)
+        sps = int(global_step / elapsed)
         log = {
-            "critic_loss": stats["critic_loss"],
+            "ep_return": float(np.mean(finished_rets)) if finished_rets else float("nan"),
+            "ep_length": float(np.mean(finished_lens)) if finished_lens else float("nan"),
+            "sps": sps,
+            "global_step": global_step,
+            "iteration": iteration,
             "q1_loss": stats["q1_loss"],
             "q2_loss": stats["q2_loss"],
+            "critic_loss": stats["critic_loss"],
             "actor_loss": stats["actor_loss"],
             "alpha_loss": stats["alpha_loss"],
             "alpha": float(alpha_value.item()),
             "q1": stats["q1"],
             "q2": stats["q2"],
+            "target_q": stats["target_q"],
             "log_pi": stats["log_pi"],
             "replay_size": replay.size,
-            "sps": sps,
-            "global_step": global_step,
-            "iteration": it,
+            "obs_rms_mean_abs": obs_rms.mean.abs().mean().item(),
         }
-        if finished_rets:
-            log["ep_return"] = float(np.mean(finished_rets))
-            log["ep_length"] = float(np.mean(finished_lens))
         try:
             wandb.log(log, step=global_step)
         except Exception:
             pass
 
-        if it % 10 == 0:
-            er = log.get("ep_return", float("nan"))
+        if iteration % 10 == 0:
             print(
-                f"[it {it:4d}] step={global_step:>9d} sps={sps:>6d} "
-                f"ret={er:8.2f} alpha={float(alpha_value.item()):.3f} "
-                f"q={stats['q1']:.2f}/{stats['q2']:.2f}"
+                f"[it {iteration:4d}] step={global_step:>9d} sps={sps:>6d} "
+                f"ret={log['ep_return']:8.2f} alpha={log['alpha']:.3f} "
+                f"q={log['q1']:.2f}/{log['q2']:.2f}"
             )
 
-        if record_every > 0 and (it + 1) % record_every == 0:
-            out = log_dir / f"rollout_iter{it + 1:06d}.mp4"
+        if record_every > 0 and iteration % record_every == 0:
+            out = log_dir / f"rollout_iter{iteration:06d}.mp4"
             try:
-                record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
-                wandb.log(
-                    {"rollout": wandb.Video(str(out), format="mp4")}, step=global_step
-                )
-            except Exception as e:
-                print(f"[rollout {it + 1}] failed: {e}")
+                record_rollout(env, agent, record_steps, out, obs_rms=obs_rms, obs_clip=obs_clip)
+                wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=global_step)
+            except Exception as exc:
+                print(f"[rollout {iteration}] failed: {exc}")
 
     alpha_scalar = float(alpha_value.item())
     log_alpha_cpu = log_alpha.detach().cpu() if log_alpha is not None else None
-    return time.time() - t0, obs_rms, global_step, alpha_scalar, log_alpha_cpu
+    return time.time() - start_time, obs_rms, global_step, alpha_scalar, log_alpha_cpu

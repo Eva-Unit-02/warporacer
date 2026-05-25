@@ -1,23 +1,17 @@
-from cv2 import (
-    IMREAD_GRAYSCALE,
-    imread,
-)
+from collections import deque
+from pathlib import Path
 
 import numpy as np
-
+from cv2 import IMREAD_GRAYSCALE, imread
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
-
 from yaml import safe_load
-
-from collections import deque
-from pathlib import Path
 
 from config import *
 
-# Map
+
 class Map:
     def __init__(self, path: Path):
         self.meta = safe_load(path.read_text())
@@ -96,4 +90,3 @@ class Map:
         self.lut = tree.query(
             np.column_stack([rows.ravel(), cols.ravel()]), workers=-1
         )[1].reshape(rows.shape)
-

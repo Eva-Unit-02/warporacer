@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import *
+from config import ACT_DIM, OBS_DIM
 
 LOG_STD_MAX = 2.0
 LOG_STD_MIN = -5.0

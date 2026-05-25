@@ -2,8 +2,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from typer import run
 import wandb
+from typer import run
 
 from agent import SACAgent
 from config import OBS_DIM
@@ -13,23 +13,26 @@ from sac import record_rollout, train
 
 def main(
     map_yaml: Path,
-    num_envs: int = 4096,
-    iterations: int = 2000,
+    num_envs: int = 512,
+    total_timesteps: int = 1_000_000,
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
-    buffer_size: int = 2_000_000,
-    batch_size: int = 1024,
-    learning_starts: int = 200_000,
-    updates_per_iter: int = 128,
+    buffer_size: int = 250_000,
+    batch_size: int = 256,
+    learning_starts: int = 25_000,
     gamma: float = 0.99,
     tau: float = 0.005,
-    actor_lr: float = 5e-5,
-    critic_lr: float = 1e-4,
-    alpha_lr: float = 5e-5,
-    policy_frequency: int = 1,
+    actor_lr: float = 3e-4,
+    critic_lr: float = 1e-3,
+    alpha_lr: float = 1e-3,
+    policy_frequency: int = 2,
+    target_network_frequency: int = 1,
+    updates_per_iter: int = 2,
     autotune: bool = True,
     alpha: float = 0.2,
+    obs_clip: float = 10.0,
+    replay_device: str = "",
     record_every: int = 100,
     record_steps: int = 1800,
     use_wandb: bool = True,
@@ -48,8 +51,8 @@ def main(
         seed=seed,
         device=device or None,
     )
-    
     agent = SACAgent(obs_dim=OBS_DIM, action_space=env.action_space).to(env.device)
+    resolved_replay_device = replay_device or env.device
 
     if use_wandb:
         try:
@@ -59,42 +62,49 @@ def main(
                 config={
                     "algorithm": "SAC",
                     "num_envs": num_envs,
-                    "iterations": iterations,
+                    "total_timesteps": total_timesteps,
                     "seed": seed,
                     "map": str(map_yaml),
+                    "device": env.device,
+                    "replay_device": resolved_replay_device,
                     "buffer_size": buffer_size,
                     "batch_size": batch_size,
                     "learning_starts": learning_starts,
-                    "updates_per_iter": updates_per_iter,
                     "gamma": gamma,
                     "tau": tau,
                     "actor_lr": actor_lr,
                     "critic_lr": critic_lr,
                     "alpha_lr": alpha_lr,
                     "policy_frequency": policy_frequency,
+                    "target_network_frequency": target_network_frequency,
+                    "updates_per_iter": updates_per_iter,
                     "autotune": autotune,
                     "alpha": alpha,
+                    "obs_clip": obs_clip,
                 },
             )
-        except Exception as e:
-            print(f"[wandb] init failed: {e}")
+        except Exception as exc:
+            print(f"[wandb] init failed: {exc}")
 
     elapsed, obs_rms, step, alpha_value, log_alpha = train(
         env,
         agent,
-        iterations=iterations,
+        total_timesteps=total_timesteps,
         buffer_size=buffer_size,
         batch_size=batch_size,
         learning_starts=learning_starts,
-        updates_per_iter=updates_per_iter,
         gamma=gamma,
         tau=tau,
         actor_lr=actor_lr,
         critic_lr=critic_lr,
         alpha_lr=alpha_lr,
         policy_frequency=policy_frequency,
+        target_network_frequency=target_network_frequency,
+        updates_per_iter=updates_per_iter,
         autotune=autotune,
         alpha=alpha,
+        obs_clip=obs_clip,
+        replay_device=resolved_replay_device,
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
@@ -114,7 +124,7 @@ def main(
     )
 
     out = log_dir / "rollout_final.mp4"
-    record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
+    record_rollout(env, agent, record_steps, out, obs_rms=obs_rms, obs_clip=obs_clip)
     try:
         wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
     except Exception:
