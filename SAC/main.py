@@ -18,7 +18,7 @@ def main(
     seed: int = 0,
     log_dir: Path = Path("./logs"),
     device: str = "",
-    buffer_size: int = 1_000_000,
+    buffer_size: int = 2_000_000,
     batch_size: int = 1024,
     learning_starts: int = 200_000,
     updates_per_iter: int = 8,
