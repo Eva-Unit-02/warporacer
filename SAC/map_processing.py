@@ -1,15 +1,18 @@
 from collections import deque
 from pathlib import Path
 
-import numpy as np
 from cv2 import IMREAD_GRAYSCALE, imread
+import numpy as np
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
 from yaml import safe_load
 
-from config import *
+try:
+    from .config import ADJ, OCC_THRESH, SMOOTH_WINDOW
+except ImportError:
+    from config import ADJ, OCC_THRESH, SMOOTH_WINDOW
 
 
 class Map:
@@ -28,41 +31,43 @@ class Map:
         self._build_lut()
 
     @staticmethod
-    def _neighbors(skel, r, c, h, w):
+    def _neighbors(skel, row, col, height, width):
         return [
-            (r + dr, c + dc)
-            for dr, dc in ADJ
-            if 0 <= r + dr < h and 0 <= c + dc < w and skel[r + dr, c + dc]
+            (row + d_row, col + d_col)
+            for d_row, d_col in ADJ
+            if 0 <= row + d_row < height
+            and 0 <= col + d_col < width
+            and skel[row + d_row, col + d_col]
         ]
 
     def _compute_centerline(self, free):
         skel = skeletonize(free)
-        h, w = skel.shape
-        pts = np.argwhere(skel)
+        height, width = skel.shape
+        points = np.argwhere(skel)
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
-        start = tuple(int(x) for x in pts[np.argmin(((pts - origin_px) ** 2).sum(1))])
-        nbrs = self._neighbors(skel, start[0], start[1], h, w)
-        if len(nbrs) < 2:
-            raise RuntimeError(f"Skeleton seed {start} has {len(nbrs)} neighbours")
-        src, target = nbrs[0], nbrs[1]
+        start = tuple(int(x) for x in points[np.argmin(((points - origin_px) ** 2).sum(1))])
+        neighbors = self._neighbors(skel, start[0], start[1], height, width)
+        if len(neighbors) < 2:
+            raise RuntimeError(f"Skeleton seed {start} has {len(neighbors)} neighbours")
+        src, target = neighbors[0], neighbors[1]
         parent = {src: src}
-        q = deque([src])
-        while q:
-            r, c = q.popleft()
-            for nr, nc in self._neighbors(skel, r, c, h, w):
-                n = (nr, nc)
-                if n in parent or n == start:
+        queue = deque([src])
+        while queue:
+            row, col = queue.popleft()
+            for next_row, next_col in self._neighbors(skel, row, col, height, width):
+                neighbor = (next_row, next_col)
+                if neighbor in parent or neighbor == start:
                     continue
-                parent[n] = (r, c)
-                if n == target:
-                    q.clear()
+                parent[neighbor] = (row, col)
+                if neighbor == target:
+                    queue.clear()
                     break
-                q.append(n)
+                queue.append(neighbor)
         path = [start]
-        n = target
-        while n != src:
-            path.append(n)
-            n = parent[n]
+        node = target
+        while node != src:
+            path.append(node)
+            node = parent[node]
         path.append(src)
         path.reverse()
         rc = np.array(path)
@@ -75,8 +80,8 @@ class Map:
         self.centerline = savgol_filter(world, SMOOTH_WINDOW, 3, axis=0, mode="wrap")
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
-        avg_sp = float(np.linalg.norm(diffs, axis=1).mean())
-        self.look_step = max(1, int(round(1.0 / avg_sp)))
+        avg_spacing = float(np.linalg.norm(diffs, axis=1).mean())
+        self.look_step = max(1, int(round(1.0 / avg_spacing)))
 
     def _build_lut(self):
         cl_px = np.column_stack(

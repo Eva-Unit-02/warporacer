@@ -22,7 +22,6 @@ V_MAX = 20.0
 PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
-# Car
 WIDTH = 0.31
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))

@@ -5,8 +5,78 @@ import numpy as np
 import torch
 import warp as wp
 
-from config import *
-from map_processing import Map
+try:
+    from .config import (
+        ACT_DIM,
+        A_MAX,
+        BETA_MAX,
+        CAR_HALF_DIAG,
+        DONE_TERMINATED,
+        DONE_TRUNCATED,
+        DR_FRAC,
+        DT_SUB,
+        DT_SUB_HALF,
+        DT_SUB_SIX,
+        G,
+        LF,
+        LIDAR_FOV,
+        LIDAR_RANGE,
+        LR,
+        MAX_STEPS,
+        MU,
+        NUM_LIDAR,
+        NUM_LOOKAHEAD,
+        OBS_DIM,
+        OBS_FRENET_OFF,
+        OBS_LOOK_OFF,
+        PSI_PRIME_MAX,
+        PROGRESS_SCALE,
+        PROGRESS_V_COEF,
+        STEER_MAX,
+        STEER_MIN,
+        STEER_V_MAX,
+        SUBSTEPS,
+        TERM_PENALTY,
+        V_MAX,
+        V_MIN,
+    )
+    from .map_processing import Map
+except ImportError:
+    from config import (
+        ACT_DIM,
+        A_MAX,
+        BETA_MAX,
+        CAR_HALF_DIAG,
+        DONE_TERMINATED,
+        DONE_TRUNCATED,
+        DR_FRAC,
+        DT_SUB,
+        DT_SUB_HALF,
+        DT_SUB_SIX,
+        G,
+        LF,
+        LIDAR_FOV,
+        LIDAR_RANGE,
+        LR,
+        MAX_STEPS,
+        MU,
+        NUM_LIDAR,
+        NUM_LOOKAHEAD,
+        OBS_DIM,
+        OBS_FRENET_OFF,
+        OBS_LOOK_OFF,
+        PSI_PRIME_MAX,
+        PROGRESS_SCALE,
+        PROGRESS_V_COEF,
+        STEER_MAX,
+        STEER_MIN,
+        STEER_V_MAX,
+        SUBSTEPS,
+        TERM_PENALTY,
+        V_MAX,
+        V_MIN,
+    )
+    from map_processing import Map
 
 
 @wp.struct
@@ -35,23 +105,23 @@ def st_deriv(
 ) -> VDeriv:
     lf = LF * lf_s
     lr = LR * lr_s
-    lwb = lf + lr
+    wheelbase = lf + lr
     mu = MU * mu_s
     a_max = mu * G
 
-    tand = wp.tan(delta)
-    d_psi_kin = v * tand / lwb
+    tan_delta = wp.tan(delta)
+    d_psi_kin = v * tan_delta / wheelbase
     d_psi_cap = a_max / wp.max(wp.abs(v), 0.5)
     d_psi = wp.clamp(d_psi_kin, -d_psi_cap, d_psi_cap)
 
     a_lat = v * d_psi
     a_long_max = wp.sqrt(wp.max(a_max * a_max - a_lat * a_lat, 0.0))
 
-    cp = wp.cos(psi)
-    sp = wp.sin(psi)
+    cos_psi = wp.cos(psi)
+    sin_psi = wp.sin(psi)
     out = VDeriv()
-    out.d_x = v * cp
-    out.d_y = v * sp
+    out.d_x = v * cos_psi
+    out.d_y = v * sin_psi
     out.d_psi = d_psi
     out.d_v = wp.clamp(accel, -a_long_max, a_long_max)
     out.d_psip = 0.0
@@ -73,12 +143,12 @@ def rk4_step(
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
-    dd = steer_v * DT_SUB_HALF
-    dd_full = steer_v * DT_SUB
+    delta_half = steer_v * DT_SUB_HALF
+    delta_full = steer_v * DT_SUB
 
     k1 = st_deriv(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
     k2 = st_deriv(
-        delta + dd,
+        delta + delta_half,
         v + k1.d_v * DT_SUB_HALF,
         psi + k1.d_psi * DT_SUB_HALF,
         psip + k1.d_psip * DT_SUB_HALF,
@@ -91,7 +161,7 @@ def rk4_step(
         lr_s,
     )
     k3 = st_deriv(
-        delta + dd,
+        delta + delta_half,
         v + k2.d_v * DT_SUB_HALF,
         psi + k2.d_psi * DT_SUB_HALF,
         psip + k2.d_psip * DT_SUB_HALF,
@@ -104,7 +174,7 @@ def rk4_step(
         lr_s,
     )
     k4 = st_deriv(
-        delta + dd_full,
+        delta + delta_full,
         v + k3.d_v * DT_SUB,
         psi + k3.d_psi * DT_SUB,
         psip + k3.d_psip * DT_SUB,
@@ -121,12 +191,8 @@ def rk4_step(
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
     out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
-    out.d_psip = (
-        k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip
-    ) * DT_SUB_SIX
-    out.d_beta = (
-        k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
-    ) * DT_SUB_SIX
+    out.d_psip = (k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip) * DT_SUB_SIX
+    out.d_beta = (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT_SUB_SIX
     return out
 
 
@@ -164,9 +230,9 @@ def step_kernel(
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
 
-    mw = dt_map.shape[0]
-    mh = dt_map.shape[1]
-    mh_f = wp.float32(mh) - 1.0
+    map_w = dt_map.shape[0]
+    map_h = dt_map.shape[1]
+    map_h_f = wp.float32(map_h) - 1.0
 
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
@@ -175,9 +241,9 @@ def step_kernel(
     if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
         accel = 0.0
 
-    dd_sub = steer_v * DT_SUB
+    delta_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
-        d = rk4_step(
+        deriv = rk4_step(
             delta,
             v,
             psi,
@@ -190,21 +256,21 @@ def step_kernel(
             lf_s,
             lr_s,
         )
-        x += d.d_x
-        y += d.d_y
-        delta += dd_sub
-        v += d.d_v
-        psi += d.d_psi
-        psip += d.d_psip
-        beta += d.d_beta
+        x += deriv.d_x
+        y += deriv.d_y
+        delta += delta_sub
+        v += deriv.d_v
+        psi += deriv.d_psi
+        psip += deriv.d_psip
+        beta += deriv.d_beta
 
     delta = wp.clamp(delta, STEER_MIN, STEER_MAX)
     v = wp.clamp(v, V_MIN, V_MAX)
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
-    py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
+    px = wp.clamp(wp.int32((x - origin[0]) / res), 0, map_w - 1)
+    py = wp.clamp(wp.int32(map_h_f - (y - origin[1]) / res), 0, map_h - 1)
     edt_val = dt_map[px, py] * res
     term = edt_val < CAR_HALF_DIAG
     trunc = steps >= MAX_STEPS
@@ -226,8 +292,7 @@ def step_kernel(
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
 
-    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + term_pen
+    reward[i] = progress + wp.where(term, -TERM_PENALTY, 0.0)
 
     if term:
         done[i] = DONE_TERMINATED
@@ -239,10 +304,10 @@ def step_kernel(
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
         rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl)) % n_cl
-        rpt = centerline[rnd]
-        x = rpt[0]
-        y = rpt[1]
-        psi = rpt[2]
+        reset_point = centerline[rnd]
+        x = reset_point[0]
+        y = reset_point[1]
+        psi = reset_point[2]
         delta = 0.0
         v = 0.0
         psip = 0.0
@@ -254,40 +319,43 @@ def step_kernel(
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    sh = wp.sin(psi)
-    ch = wp.cos(psi)
-    lx = x + LF * ch
-    ly = y + LF * sh
-    lpx = wp.clamp(wp.int32((lx - origin[0]) / res), 0, mw - 1)
-    lpy = wp.clamp(wp.int32(mh_f - (ly - origin[1]) / res), 0, mh - 1)
-    lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
-    lrange_px = LIDAR_RANGE / res
+    sin_psi = wp.sin(psi)
+    cos_psi = wp.cos(psi)
+    lidar_x = x + LF * cos_psi
+    lidar_y = y + LF * sin_psi
+    lidar_px = wp.clamp(wp.int32((lidar_x - origin[0]) / res), 0, map_w - 1)
+    lidar_py = wp.clamp(wp.int32(map_h_f - (lidar_y - origin[1]) / res), 0, map_h - 1)
+    lidar_pos = wp.vec2(wp.float32(lidar_px), wp.float32(lidar_py))
+    lidar_range_px = LIDAR_RANGE / res
     for j in range(lidar_dirs.shape[0]):
-        ca = lidar_dirs[j][0]
-        sa = lidar_dirs[j][1]
-        dpx = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
-        ray = lpos
+        cos_a = lidar_dirs[j][0]
+        sin_a = lidar_dirs[j][1]
+        dpx = wp.vec2(cos_psi * cos_a - sin_psi * sin_a, -(sin_psi * cos_a + cos_psi * sin_a))
+        ray = lidar_pos
         dist = float(0.0)
-        while dist < lrange_px:
+        while dist < lidar_range_px:
             rx = wp.int32(ray[0])
             ry = wp.int32(ray[1])
-            if rx < 0 or rx >= mw or ry < 0 or ry >= mh:
+            if rx < 0 or rx >= map_w or ry < 0 or ry >= map_h:
                 break
             step_px = dt_map[rx, ry]
             ray = ray + dpx * step_px
             dist += step_px
             if step_px == 0.0:
                 break
-        obs[i, 3 + j] = wp.min(dist, lrange_px) * res
+        obs[i, 3 + j] = wp.min(dist, lidar_range_px) * res
 
     cpt = centerline[new_wp]
     cx_p = cpt[0]
     cy_p = cpt[1]
     cth_p = cpt[2]
-    s_cth = wp.sin(cth_p)
-    c_cth = wp.cos(cth_p)
-    heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
-    lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
+    sin_cth = wp.sin(cth_p)
+    cos_cth = wp.cos(cth_p)
+    heading_err = wp.atan2(
+        sin_cth * cos_psi - cos_cth * sin_psi,
+        cos_cth * cos_psi + sin_cth * sin_psi,
+    )
+    lateral_err = -(x - cx_p) * sin_cth + (y - cy_p) * cos_cth
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
 
@@ -296,11 +364,11 @@ def step_kernel(
         idx += look_step
         if idx >= n_cl:
             idx -= n_cl
-        w = centerline[idx]
-        dx = w[0] - x
-        dy = w[1] - y
-        obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
-        obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
+        waypoint = centerline[idx]
+        dx = waypoint[0] - x
+        dy = waypoint[1] - y
+        obs[i, OBS_LOOK_OFF + k * 2] = dx * cos_psi + dy * sin_psi
+        obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sin_psi + dy * cos_psi
 
     obs[i, 0] = delta
     obs[i, 1] = v
@@ -329,14 +397,14 @@ class RacingEnv:
         self.map = Map(map_path)
         self.look_step = self.map.look_step
         self.seed_base = int(seed)
-        d = self.device
+        warp_device = self.device
 
-        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
-        self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
+        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=warp_device)
+        self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=warp_device)
         self.centerline_buf = wp.array(
             np.column_stack([self.map.centerline, self.map.angles]).astype(np.float32),
             dtype=wp.vec3,
-            device=d,
+            device=warp_device,
         )
         self.n_cl = len(self.map.centerline)
 
@@ -348,16 +416,14 @@ class RacingEnv:
         cars[:, 4] = self.map.angles[idxs]
         cars_int = np.zeros((num_envs, 2), dtype=np.int32)
         cars_int[:, 1] = idxs
-        dr_init = (
-            1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
-        )
+        dr_init = 1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
 
-        self.cars = wp.array(cars, dtype=float, device=d)
-        self.cars_int = wp.array(cars_int, dtype=int, device=d)
-        self.car_dr = wp.array(dr_init, dtype=float, device=d)
-        self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
-        self.rew = wp.zeros(num_envs, dtype=float, device=d)
-        self.done = wp.zeros(num_envs, dtype=int, device=d)
+        self.cars = wp.array(cars, dtype=float, device=warp_device)
+        self.cars_int = wp.array(cars_int, dtype=int, device=warp_device)
+        self.car_dr = wp.array(dr_init, dtype=float, device=warp_device)
+        self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=warp_device)
+        self.rew = wp.zeros(num_envs, dtype=float, device=warp_device)
+        self.done = wp.zeros(num_envs, dtype=int, device=warp_device)
 
         self.obs_buf = wp.to_torch(self.obs)
         self.rew_buf = wp.to_torch(self.rew)
@@ -370,9 +436,9 @@ class RacingEnv:
         self.lidar_buf = wp.array(
             np.column_stack([np.cos(angles), np.sin(angles)]),
             dtype=wp.vec2,
-            device=d,
+            device=warp_device,
         )
-        self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
+        self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=warp_device)
         self._call = 0
         self._launch(self._zero_act)
         self._sanitize()
@@ -408,9 +474,7 @@ class RacingEnv:
         self._call += 1
 
     def _sanitize(self):
-        bad = ~(
-            torch.isfinite(self.obs_buf).all(1) & torch.isfinite(self.cars_buf).all(1)
-        )
+        bad = ~(torch.isfinite(self.obs_buf).all(1) & torch.isfinite(self.cars_buf).all(1))
         if not bad.any():
             return
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
@@ -441,16 +505,14 @@ class RacingEnv:
 
     def save_state(self):
         return {
-            k: getattr(self, k).clone()
-            for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
-        } | {
-            "car_dr": wp.to_torch(self.car_dr).clone(),
-        }
+            key: getattr(self, key).clone()
+            for key in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
+        } | {"car_dr": wp.to_torch(self.car_dr).clone()}
 
-    def restore_state(self, s):
-        self.cars_buf.copy_(s["cars_buf"])
-        self.cars_int_buf.copy_(s["cars_int_buf"])
-        wp.to_torch(self.car_dr).copy_(s["car_dr"])
-        self.obs_buf.copy_(s["obs_buf"])
-        self.rew_buf.copy_(s["rew_buf"])
-        self.done_buf.copy_(s["done_buf"])
+    def restore_state(self, state):
+        self.cars_buf.copy_(state["cars_buf"])
+        self.cars_int_buf.copy_(state["cars_int_buf"])
+        wp.to_torch(self.car_dr).copy_(state["car_dr"])
+        self.obs_buf.copy_(state["obs_buf"])
+        self.rew_buf.copy_(state["rew_buf"])
+        self.done_buf.copy_(state["done_buf"])

@@ -2,40 +2,42 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import wandb
 from typer import run
+import wandb
 
-from agent import SACAgent
-from config import OBS_DIM
-from racing_env import RacingEnv
-from sac import record_rollout, train
+try:
+    from .agent import SACAgent
+    from .config import ACT_DIM, OBS_DIM
+    from .racing_env import RacingEnv
+    from .sac import record_rollout, train
+except ImportError:
+    from agent import SACAgent
+    from config import ACT_DIM, OBS_DIM
+    from racing_env import RacingEnv
+    from sac import record_rollout, train
 
 
 def main(
     map_yaml: Path,
-    num_envs: int = 512,
-    total_timesteps: int = 1_000_000,
+    num_envs: int = 4096,
+    iterations: int = 2000,
     seed: int = 0,
-    log_dir: Path = Path("./logs"),
-    device: str = "",
-    buffer_size: int = 250_000,
-    batch_size: int = 256,
-    learning_starts: int = 25_000,
+    hidden: int = 256,
+    buffer_size: int = 262_144,
+    batch_size: int = 1024,
+    learning_starts: int = 16_384,
+    utd: float = 1.0,
     gamma: float = 0.99,
     tau: float = 0.005,
     actor_lr: float = 3e-4,
-    critic_lr: float = 1e-3,
-    alpha_lr: float = 1e-3,
-    policy_frequency: int = 2,
-    target_network_frequency: int = 1,
-    updates_per_iter: int = 2,
-    autotune: bool = True,
-    alpha: float = 0.2,
-    obs_clip: float = 10.0,
-    replay_device: str = "",
-    record_every: int = 100,
+    critic_lr: float = 3e-4,
+    alpha_lr: float = 3e-4,
+    log_dir: Path = Path("./logs_sac"),
+    device: str = "",
+    record_every: int = 250,
     record_steps: int = 1800,
     use_wandb: bool = True,
+    wandb_project: str = "warporacer",
 ):
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
@@ -51,65 +53,53 @@ def main(
         seed=seed,
         device=device or None,
     )
-    agent = SACAgent(obs_dim=OBS_DIM, action_space=env.action_space).to(env.device)
-    resolved_replay_device = replay_device or env.device
+    agent = SACAgent(obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=hidden).to(env.device)
 
     if use_wandb:
         try:
             wandb.init(
-                project="warporacer",
+                project=wandb_project,
                 name=f"sac_seed{seed}_n{num_envs}",
                 config={
                     "algorithm": "SAC",
                     "num_envs": num_envs,
-                    "total_timesteps": total_timesteps,
+                    "iterations": iterations,
                     "seed": seed,
                     "map": str(map_yaml),
-                    "device": env.device,
-                    "replay_device": resolved_replay_device,
+                    "hidden": hidden,
                     "buffer_size": buffer_size,
                     "batch_size": batch_size,
                     "learning_starts": learning_starts,
+                    "utd": utd,
                     "gamma": gamma,
                     "tau": tau,
                     "actor_lr": actor_lr,
                     "critic_lr": critic_lr,
                     "alpha_lr": alpha_lr,
-                    "policy_frequency": policy_frequency,
-                    "target_network_frequency": target_network_frequency,
-                    "updates_per_iter": updates_per_iter,
-                    "autotune": autotune,
-                    "alpha": alpha,
-                    "obs_clip": obs_clip,
+                    "device": env.device,
                 },
             )
         except Exception as exc:
             print(f"[wandb] init failed: {exc}")
 
-    elapsed, obs_rms, step, alpha_value, log_alpha = train(
+    elapsed, obs_rms, env_steps, gradient_steps, alpha = train(
         env,
         agent,
-        total_timesteps=total_timesteps,
+        iterations=iterations,
         buffer_size=buffer_size,
         batch_size=batch_size,
-        learning_starts=learning_starts,
         gamma=gamma,
         tau=tau,
         actor_lr=actor_lr,
         critic_lr=critic_lr,
         alpha_lr=alpha_lr,
-        policy_frequency=policy_frequency,
-        target_network_frequency=target_network_frequency,
-        updates_per_iter=updates_per_iter,
-        autotune=autotune,
-        alpha=alpha,
-        obs_clip=obs_clip,
-        replay_device=resolved_replay_device,
+        learning_starts=learning_starts,
+        utd=utd,
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
     )
-    print(f"[done] {elapsed:.1f}s")
+    print(f"[done] {elapsed:.1f}s env_steps={env_steps} gradient_steps={gradient_steps}")
 
     torch.save(
         {
@@ -117,16 +107,15 @@ def main(
             "obs_mean": obs_rms.mean.cpu(),
             "obs_var": obs_rms.var.cpu(),
             "obs_count": obs_rms.count,
-            "alpha": alpha_value,
-            "log_alpha": log_alpha,
+            "alpha": alpha,
         },
         log_dir / "agent_final.pt",
     )
 
     out = log_dir / "rollout_final.mp4"
-    record_rollout(env, agent, record_steps, out, obs_rms=obs_rms, obs_clip=obs_clip)
+    record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
     try:
-        wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
+        wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=env_steps)
     except Exception:
         pass
 
