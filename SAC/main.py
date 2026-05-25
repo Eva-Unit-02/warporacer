@@ -22,7 +22,7 @@ def main(
     batch_size: int = 1024,
     learning_starts: int = 200_000,
     updates_per_iter: int = 8,
-    gamma: float = 0.995,
+    gamma: float = 0.991,
     tau: float = 0.004,
     actor_lr: float = 1e-4,
     critic_lr: float = 3e-4,
