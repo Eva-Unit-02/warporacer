@@ -55,6 +55,7 @@ class ReplayBuffer:
         self.actions = torch.zeros((capacity, act_dim), dtype=torch.float32, device=device)
         self.rewards = torch.zeros(capacity, dtype=torch.float32, device=device)
         self.dones = torch.zeros(capacity, dtype=torch.float32, device=device)
+        self.discounts = torch.zeros(capacity, dtype=torch.float32, device=device)
         self.cursor = 0
         self.size = 0
 
@@ -65,6 +66,7 @@ class ReplayBuffer:
         rewards: torch.Tensor,
         next_obs: torch.Tensor,
         dones: torch.Tensor,
+        discounts: torch.Tensor,
     ):
         batch = obs.shape[0]
         indices = (torch.arange(batch, device=self.obs.device) + self.cursor) % self.capacity
@@ -73,6 +75,7 @@ class ReplayBuffer:
         self.rewards[indices] = rewards
         self.next_obs[indices] = next_obs
         self.dones[indices] = dones
+        self.discounts[indices] = discounts
         self.cursor = (self.cursor + batch) % self.capacity
         self.size = min(self.size + batch, self.capacity)
 
@@ -84,7 +87,98 @@ class ReplayBuffer:
             "rewards": self.rewards[indices],
             "next_obs": self.next_obs[indices],
             "dones": self.dones[indices],
+            "discounts": self.discounts[indices],
         }
+
+
+class NStepBuilder:
+    def __init__(self, num_envs: int, obs_dim: int, act_dim: int, n_step: int, gamma: float, device):
+        self.num_envs = num_envs
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.n_step = max(1, int(n_step))
+        self.gamma = gamma
+        self.device = device
+        self.obs = torch.zeros((self.n_step, num_envs, obs_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((self.n_step, num_envs, act_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.zeros((self.n_step, num_envs), dtype=torch.float32, device=device)
+        self.next_obs = torch.zeros((self.n_step, num_envs, obs_dim), dtype=torch.float32, device=device)
+        self.dones = torch.zeros((self.n_step, num_envs), dtype=torch.float32, device=device)
+        self.lengths = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.ready = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.gamma_powers = gamma ** torch.arange(self.n_step, dtype=torch.float32, device=device)
+        self.length_discounts = gamma ** torch.arange(self.n_step + 1, dtype=torch.float32, device=device)
+
+    def append(
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+    ):
+        if self.n_step > 1:
+            self.obs[:-1].copy_(self.obs[1:])
+            self.actions[:-1].copy_(self.actions[1:])
+            self.rewards[:-1].copy_(self.rewards[1:])
+            self.next_obs[:-1].copy_(self.next_obs[1:])
+            self.dones[:-1].copy_(self.dones[1:])
+
+        self.obs[-1] = obs
+        self.actions[-1] = actions
+        self.rewards[-1] = rewards
+        self.next_obs[-1] = next_obs
+        self.dones[-1] = dones
+        self.lengths.clamp_(max=self.n_step - 1).add_(1)
+        self.ready = self.ready | (self.lengths >= self.n_step) | dones.bool()
+
+    def pop_ready(self):
+        ready = self.ready
+        if not ready.any():
+            return None
+
+        lengths = self.lengths.clamp(min=1)
+        oldest_rows = self.n_step - lengths
+        env_ids = torch.nonzero(ready, as_tuple=False).squeeze(-1)
+        out_obs = self.obs[oldest_rows[env_ids], env_ids]
+        out_actions = self.actions[oldest_rows[env_ids], env_ids]
+
+        rows = torch.arange(self.n_step, device=self.device).view(-1, 1)
+        start_rows = oldest_rows.view(1, -1)
+        local_steps = (rows - start_rows).clamp(min=0, max=self.n_step - 1)
+        active = rows >= start_rows
+        weights = self.gamma_powers[local_steps]
+        rewards = (self.rewards * weights * active).sum(dim=0)
+
+        active_dones = self.dones * active
+        done_cumsum = active_dones.cumsum(dim=0)
+        first_done_mask = (active_dones > 0.0) & (done_cumsum == 1.0)
+        first_done_any = first_done_mask.any(dim=0)
+        bootstrap_row = torch.where(
+            first_done_any,
+            first_done_mask.float().argmax(dim=0),
+            self.n_step - 1,
+        )
+
+        out_next_obs = self.next_obs[bootstrap_row[env_ids], env_ids]
+        out_rewards = rewards[env_ids]
+        out_dones = first_done_any[env_ids].float()
+        out_discounts = torch.where(
+            first_done_any,
+            torch.zeros_like(self.length_discounts[lengths]),
+            self.length_discounts[lengths],
+        )[env_ids]
+
+        done_envs = self.dones[bootstrap_row[env_ids], env_ids] > 0.0
+        self.ready[env_ids] = False
+        self.lengths[env_ids] = torch.where(
+            done_envs,
+            torch.zeros_like(self.lengths[env_ids]),
+            (self.lengths[env_ids] - 1).clamp_min(0),
+        )
+        self.ready[env_ids[~done_envs]] = self.lengths[env_ids[~done_envs]] >= self.n_step
+
+        return out_obs, out_actions, out_rewards, out_next_obs, out_dones, out_discounts
 
 
 def soft_update(target: TD3Agent, source: TD3Agent, tau: float):
@@ -158,6 +252,7 @@ def train(
     buffer_size: int = 262_144,
     batch_size: int = 1024,
     learning_starts: int = 16_384,
+    n_step: int = 5,
     utd: float = 1.0,
     gamma: float = 0.99,
     tau: float = 0.005,
@@ -176,6 +271,7 @@ def train(
 
     obs_rms = RunningStats((OBS_DIM,), device)
     replay = ReplayBuffer(buffer_size, OBS_DIM, ACT_DIM, device)
+    n_step_builder = NStepBuilder(num_envs, OBS_DIM, ACT_DIM, n_step, gamma, device)
     target = agent.target_copy().to(device)
 
     actor_optimizer = torch.optim.Adam(agent.actor.parameters(), lr=actor_lr)
@@ -210,7 +306,10 @@ def train(
 
             next_raw_obs, reward, terminated, truncated, _ = env.step(action)
             done = (terminated | truncated).to(dtype=torch.float32)
-            replay.add(transition_obs, action, reward, next_raw_obs, done)
+            n_step_builder.append(transition_obs, action, reward, next_raw_obs, done)
+            n_step_batch = n_step_builder.pop_ready()
+            if n_step_batch is not None:
+                replay.add(*n_step_batch)
 
             episode_returns.add_(reward)
             episode_lengths.add_(1.0)
@@ -247,6 +346,7 @@ def train(
                 batch_actions = batch["actions"]
                 batch_rewards = batch["rewards"]
                 batch_dones = batch["dones"]
+                batch_discounts = batch["discounts"]
 
                 with torch.no_grad():
                     smoothing = (torch.randn_like(batch_actions) * target_policy_noise).clamp(
@@ -255,7 +355,7 @@ def train(
                     next_action = (target.act(batch_next_obs) + smoothing).clamp(-1.0, 1.0)
                     target_q1, target_q2 = target.q_values(batch_next_obs, next_action)
                     clipped_target_q = torch.minimum(target_q1, target_q2)
-                    target_q = batch_rewards + gamma * (1.0 - batch_dones) * clipped_target_q
+                    target_q = batch_rewards + batch_discounts * (1.0 - batch_dones) * clipped_target_q
 
                 q1, q2 = agent.q_values(batch_obs, batch_actions)
                 critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
@@ -318,6 +418,7 @@ def train(
             "target_policy_noise": target_policy_noise,
             "target_noise_clip": target_noise_clip,
             "policy_delay": policy_delay,
+            "n_step": n_step,
             "obs_rms_count": obs_rms.count,
             "sps": sps,
         }
