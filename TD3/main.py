@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -38,47 +39,49 @@ def _build_training_env(map_yamls: list[Path], num_envs: int, seed: int, device:
     )
 
 
-def _record_all_maps(
-    maps_dir: Path,
-    log_dir: Path,
+def _record_maps_to_wandb(
+    map_yamls: list[Path],
     agent: TD3Agent,
     obs_rms,
     record_steps: int,
     seed: int,
     device: str,
     env_steps: int,
+    enabled: bool,
 ):
-    eval_maps = sorted(maps_dir.glob("*.yaml"))
-    eval_dir = log_dir / "rollouts_all_maps"
-    eval_dir.mkdir(parents=True, exist_ok=True)
+    if not enabled:
+        print("[rollout skip] W&B disabled, so final rollout videos were not recorded")
+        return
+
     skipped: list[str] = []
+    with TemporaryDirectory(prefix="warporacer_td3_rollouts_") as temp_dir:
+        temp_path = Path(temp_dir)
+        for idx, eval_map in enumerate(map_yamls):
+            try:
+                eval_env = RacingEnv(
+                    eval_map,
+                    num_envs=1,
+                    seed=seed + 100_000 + idx,
+                    device=device,
+                )
+                video_path = temp_path / f"{eval_map.stem}.mp4"
+                record_rollout(eval_env, agent, record_steps, video_path, obs_rms=obs_rms)
+            except Exception as exc:
+                message = f"{eval_map}: {type(exc).__name__}: {exc}"
+                skipped.append(message)
+                print(f"[rollout skip] {message}")
+                continue
 
-    for idx, eval_map in enumerate(eval_maps):
-        try:
-            eval_env = RacingEnv(
-                eval_map,
-                num_envs=1,
-                seed=seed + 100_000 + idx,
-                device=device,
-            )
-            video_path = eval_dir / f"{eval_map.stem}.mp4"
-            record_rollout(eval_env, agent, record_steps, video_path, obs_rms=obs_rms)
-        except Exception as exc:
-            message = f"{eval_map}: {type(exc).__name__}: {exc}"
-            skipped.append(message)
-            print(f"[rollout skip] {message}")
-            continue
-
-        try:
-            wandb.log(
-                {f"rollout_{eval_map.stem}": wandb.Video(str(video_path), format="mp4")},
-                step=env_steps,
-            )
-        except Exception:
-            pass
+            try:
+                wandb.log(
+                    {f"rollout_{eval_map.stem}": wandb.Video(str(video_path), format="mp4")},
+                    step=env_steps,
+                )
+            except Exception as exc:
+                print(f"[wandb rollout] failed for {eval_map}: {exc}")
 
     if skipped:
-        (eval_dir / "skipped_maps.txt").write_text("\n".join(skipped) + "\n")
+        print("[rollout skip] skipped maps: " + "; ".join(skipped))
 
 
 def _load_checkpoint(checkpoint_path: Path, agent: TD3Agent, device: str):
@@ -96,7 +99,7 @@ def _load_checkpoint(checkpoint_path: Path, agent: TD3Agent, device: str):
 def main(
     map_yamls: list[Path],
     num_envs: int = 4096,
-    iterations: int = 16000,
+    iterations: int = 8000,
     seed: int = 0,
     hidden: int = 256,
     buffer_size: int = 262_144,
@@ -139,16 +142,30 @@ def main(
         agent = TD3Agent(obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=hidden).to(run_device)
         loaded_checkpoint, obs_rms = _load_checkpoint(checkpoint, agent, run_device)
         env_steps = int(loaded_checkpoint.get("env_steps", 0))
-        maps_dir = Path(__file__).resolve().parent.parent / "maps"
-        _record_all_maps(
-            maps_dir=maps_dir,
-            log_dir=log_dir,
+        eval_maps = [Path(path) for path in loaded_checkpoint.get("train_maps", train_map_names)]
+        if use_wandb:
+            try:
+                wandb.init(
+                    project=wandb_project,
+                    name=f"td3_rollouts_seed{seed}",
+                    config={
+                        "algorithm": "TD3",
+                        "checkpoint": str(checkpoint),
+                        "maps": [str(path) for path in eval_maps],
+                        "device": run_device,
+                    },
+                )
+            except Exception as exc:
+                print(f"[wandb] init failed: {exc}")
+        _record_maps_to_wandb(
+            map_yamls=eval_maps,
             agent=agent,
             obs_rms=obs_rms,
             record_steps=record_steps,
             seed=seed,
             device=run_device,
             env_steps=env_steps,
+            enabled=use_wandb,
         )
         return
 
@@ -227,16 +244,15 @@ def main(
     }
     torch.save(checkpoint, log_dir / "agent_final.pt")
 
-    maps_dir = Path(__file__).resolve().parent.parent / "maps"
-    _record_all_maps(
-        maps_dir=maps_dir,
-        log_dir=log_dir,
+    _record_maps_to_wandb(
+        map_yamls=map_yamls,
         agent=agent,
         obs_rms=obs_rms,
         record_steps=record_steps,
         seed=seed,
         device=env.device,
         env_steps=env_steps,
+        enabled=use_wandb,
     )
 
 

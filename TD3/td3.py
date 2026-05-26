@@ -239,6 +239,11 @@ def record_rollout(env, agent, num_steps: int, out_path: Path, obs_rms: RunningS
                         [np.array([world_to_pixel(px, py) for px, py in polygon], dtype=np.int32)],
                         (255, 50, 50),
                     )
+                    height, width = frame.shape[:2]
+                    if height % 2 != 0 or width % 2 != 0:
+                        padded = np.zeros((height + height % 2, width + width % 2, 3), dtype=frame.dtype)
+                        padded[:height, :width] = frame
+                        frame = padded
                     writer.append_data(frame)
     finally:
         env.restore_state(snapshot)
