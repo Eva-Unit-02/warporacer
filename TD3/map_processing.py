@@ -101,7 +101,9 @@ class Map:
         )
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.heading = np.arctan2(diffs[:, 1], diffs[:, 0])
-        average_spacing = float(np.linalg.norm(diffs, axis=1).mean())
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        self.track_length = float(segment_lengths.sum())
+        average_spacing = float(segment_lengths.mean())
         self.lookahead_stride = max(1, int(round(1.0 / average_spacing)))
 
     def _build_waypoint_lookup(self):

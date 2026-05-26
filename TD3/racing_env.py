@@ -37,6 +37,7 @@ try:
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
+        STALL_PENALTY,
         STEER_MAX,
         STEER_MIN,
         STEER_RATE_MAX,
@@ -77,6 +78,7 @@ except ImportError:
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
+        STALL_PENALTY,
         STEER_MAX,
         STEER_MIN,
         STEER_RATE_MAX,
@@ -235,6 +237,7 @@ def advance_kernel(
     nearest_waypoint: wp.array2d(dtype=wp.int32),
     centerline: wp.array(dtype=wp.vec3),
     num_waypoints: int,
+    track_length: float,
     lookahead_stride: int,
     lidar_basis: wp.array(dtype=wp.vec2),
     seed_base: int,
@@ -242,6 +245,8 @@ def advance_kernel(
     env_id = wp.tid()
     x = cars[env_id, 0]
     y = cars[env_id, 1]
+    prev_x = x
+    prev_y = y
     steer = cars[env_id, 2]
     velocity = cars[env_id, 3]
     heading = cars[env_id, 4]
@@ -328,13 +333,16 @@ def advance_kernel(
 
     tangent = centerline[current_waypoint][2]
     forward_speed = velocity * wp.cos(slip_angle + heading - tangent)
+    prev_tangent = centerline[waypoint_index][2]
+    step_forward_distance = (x - prev_x) * wp.cos(prev_tangent) + (y - prev_y) * wp.sin(prev_tangent)
     progress_reward = (
-        wp.float32(waypoint_delta)
-        / wp.float32(num_waypoints)
+        step_forward_distance
+        / track_length
         * PROGRESS_REWARD_SCALE
         * (1.0 + wp.max(forward_speed, 0.0) / PROGRESS_SPEED_SCALE)
     )
-    rewards[env_id] = progress_reward + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
+    stall_cost = wp.where(step_forward_distance <= 0.0, -STALL_PENALTY, 0.0)
+    rewards[env_id] = progress_reward + stall_cost + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
 
     if terminated:
         done_codes[env_id] = DONE_TERMINATED
@@ -510,6 +518,7 @@ class RacingEnv:
                 self.waypoint_lut,
                 self.centerline,
                 self.num_waypoints,
+                self.map.track_length,
                 self.lookahead_stride,
                 self.lidar_dirs,
                 int(launch_seed),
