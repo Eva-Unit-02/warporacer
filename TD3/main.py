@@ -22,7 +22,7 @@ except ImportError:
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 1000,
     seed: int = 0,
     hidden: int = 256,
     buffer_size: int = 262_144,
