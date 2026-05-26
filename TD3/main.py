@@ -22,7 +22,7 @@ except ImportError:
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 4000,
+    iterations: int = 8000,
     seed: int = 0,
     hidden: int = 256,
     buffer_size: int = 262_144,
@@ -40,7 +40,7 @@ def main(
     policy_delay: int = 2,
     log_dir: Path = Path("./logs_td3"),
     device: str = "",
-    record_every: int = 200,
+    record_every: int = 2000,
     record_steps: int = 1800,
     use_wandb: bool = True,
     wandb_project: str = "warporacer",
