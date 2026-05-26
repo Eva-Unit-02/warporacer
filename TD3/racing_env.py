@@ -14,6 +14,9 @@ try:
         CAR_HALF_DIAG,
         CAR_LENGTH,
         CAR_WIDTH,
+        CIRCLE_MIN_DISPLACEMENT,
+        CIRCLE_PENALTY_COEF,
+        CIRCLE_ROTATION_THRESHOLD,
         DONE_TERMINATED,
         DONE_TRUNCATED,
         DRIFT_FRACTION,
@@ -56,6 +59,9 @@ except ImportError:
         CAR_HALF_DIAG,
         CAR_LENGTH,
         CAR_WIDTH,
+        CIRCLE_MIN_DISPLACEMENT,
+        CIRCLE_PENALTY_COEF,
+        CIRCLE_ROTATION_THRESHOLD,
         DONE_TERMINATED,
         DONE_TRUNCATED,
         DRIFT_FRACTION,
@@ -233,6 +239,8 @@ def advance_kernel(
     cars: wp.array2d(dtype=wp.float32),
     car_meta: wp.array2d(dtype=wp.int32),
     turn_hold_times: wp.array(dtype=wp.float32),
+    circle_rotations: wp.array(dtype=wp.float32),
+    circle_start_positions: wp.array(dtype=wp.vec2),
     domain_randomization: wp.array2d(dtype=wp.float32),
     map_origin: wp.vec2,
     map_resolution: float,
@@ -247,14 +255,19 @@ def advance_kernel(
     env_id = wp.tid()
     x = cars[env_id, 0]
     y = cars[env_id, 1]
+    prev_x = x
+    prev_y = y
     steer = cars[env_id, 2]
     velocity = cars[env_id, 3]
     heading = cars[env_id, 4]
+    prev_heading = heading
     yaw_rate = cars[env_id, 5]
     slip_angle = cars[env_id, 6]
     step_count = car_meta[env_id, 0]
     waypoint_index = car_meta[env_id, 1]
     turn_hold_time = turn_hold_times[env_id]
+    circle_rotation = circle_rotations[env_id]
+    circle_start = circle_start_positions[env_id]
 
     mu_scale = domain_randomization[env_id, 0]
     mass_scale = domain_randomization[env_id, 1]
@@ -332,7 +345,38 @@ def advance_kernel(
         -TURN_PENALTY_COEF * turn_frac * turn_frac,
         0.0,
     )
-    rewards[env_id] = progress_reward + turn_penalty + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
+
+    heading_delta = wp.atan2(wp.sin(heading - prev_heading), wp.cos(heading - prev_heading))
+    circle_penalty = 0.0
+    if turn_excess > 0.0:
+        if circle_rotation <= 0.0:
+            circle_start = wp.vec2(prev_x, prev_y)
+        circle_rotation += wp.abs(heading_delta)
+        circle_dx = x - circle_start[0]
+        circle_dy = y - circle_start[1]
+        circle_displacement = wp.sqrt(circle_dx * circle_dx + circle_dy * circle_dy)
+        circle_excess = wp.max(circle_rotation - CIRCLE_ROTATION_THRESHOLD, 0.0)
+        circle_tightness = wp.max(CIRCLE_MIN_DISPLACEMENT - circle_displacement, 0.0) / wp.max(
+            CIRCLE_MIN_DISPLACEMENT,
+            1e-6,
+        )
+        circle_penalty = wp.where(
+            circle_rotation > CIRCLE_ROTATION_THRESHOLD,
+            -CIRCLE_PENALTY_COEF * circle_tightness * circle_tightness * (
+                1.0 + circle_excess / CIRCLE_ROTATION_THRESHOLD
+            ),
+            0.0,
+        )
+    else:
+        circle_rotation = 0.0
+        circle_start = wp.vec2(x, y)
+
+    rewards[env_id] = (
+        progress_reward
+        + turn_penalty
+        + circle_penalty
+        + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
+    )
 
     if terminated:
         done_codes[env_id] = DONE_TERMINATED
@@ -353,6 +397,8 @@ def advance_kernel(
         yaw_rate = 0.0
         slip_angle = 0.0
         turn_hold_time = 0.0
+        circle_rotation = 0.0
+        circle_start = wp.vec2(x, y)
         step_count = 0
         current_waypoint = reset_index
         domain_randomization[env_id, 0] = 1.0 - DRIFT_FRACTION + 2.0 * DRIFT_FRACTION * wp.randf(rng)
@@ -430,6 +476,8 @@ def advance_kernel(
     car_meta[env_id, 0] = step_count
     car_meta[env_id, 1] = current_waypoint
     turn_hold_times[env_id] = turn_hold_time
+    circle_rotations[env_id] = circle_rotation
+    circle_start_positions[env_id] = circle_start
 
 
 class RacingEnv:
@@ -468,6 +516,8 @@ class RacingEnv:
         self.car_state = wp.array(car_state, dtype=float, device=wp_device)
         self.car_meta = wp.array(car_meta, dtype=int, device=wp_device)
         self.turn_hold_times = wp.zeros(num_envs, dtype=float, device=wp_device)
+        self.circle_rotations = wp.zeros(num_envs, dtype=float, device=wp_device)
+        self.circle_start_positions = wp.zeros(num_envs, dtype=wp.vec2, device=wp_device)
         self.randomized_params = wp.array(randomized, dtype=float, device=wp_device)
         self.observations = wp.zeros((num_envs, OBS_DIM), dtype=float, device=wp_device)
         self.rewards = wp.zeros(num_envs, dtype=float, device=wp_device)
@@ -479,6 +529,8 @@ class RacingEnv:
         self.car_state_torch = wp.to_torch(self.car_state)
         self.car_meta_torch = wp.to_torch(self.car_meta)
         self.turn_hold_torch = wp.to_torch(self.turn_hold_times)
+        self.circle_rotation_torch = wp.to_torch(self.circle_rotations)
+        self.circle_start_torch = wp.to_torch(self.circle_start_positions)
         self._step_counts = self.car_meta_torch[:, 0]
 
         lidar_angles = np.linspace(-LIDAR_FOV * 0.5, LIDAR_FOV * 0.5, NUM_LIDAR, dtype=np.float32)
@@ -506,6 +558,8 @@ class RacingEnv:
                 self.car_state,
                 self.car_meta,
                 self.turn_hold_times,
+                self.circle_rotations,
+                self.circle_start_positions,
                 self.randomized_params,
                 wp.vec2(self.map.origin_x, self.map.origin_y),
                 self.map.resolution,
@@ -537,6 +591,8 @@ class RacingEnv:
         self._sanitize_buffers()
         self._step_counts.zero_()
         self.turn_hold_torch.zero_()
+        self.circle_rotation_torch.zero_()
+        self.circle_start_torch.zero_()
         self.rew_torch.zero_()
         self.done_torch.zero_()
         return self.obs_torch, {}
@@ -561,6 +617,8 @@ class RacingEnv:
             "rewards": self.rew_torch.clone(),
             "done_codes": self.done_torch.clone(),
             "turn_hold_times": self.turn_hold_torch.clone(),
+            "circle_rotations": self.circle_rotation_torch.clone(),
+            "circle_start_positions": self.circle_start_torch.clone(),
             "randomized_params": wp.to_torch(self.randomized_params).clone(),
             "launch_count": self._launch_count,
         }
@@ -573,5 +631,7 @@ class RacingEnv:
         self.rew_torch.copy_(snapshot["rewards"])
         self.done_torch.copy_(snapshot["done_codes"])
         self.turn_hold_torch.copy_(snapshot["turn_hold_times"])
+        self.circle_rotation_torch.copy_(snapshot["circle_rotations"])
+        self.circle_start_torch.copy_(snapshot["circle_start_positions"])
         wp.to_torch(self.randomized_params).copy_(snapshot["randomized_params"])
         self._launch_count = snapshot["launch_count"]
