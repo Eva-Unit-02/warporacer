@@ -32,17 +32,16 @@ try:
         OBS_DIM,
         OBS_FRENET_OFFSET,
         OBS_LOOKAHEAD_OFFSET,
-        PROGRESS_BACK_WINDOW,
-        PROGRESS_FORWARD_WINDOW,
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
-        STALL_PENALTY,
         STEER_MAX,
         STEER_MIN,
         STEER_RATE_MAX,
         SUBSTEPS,
         TERMINATION_PENALTY,
+        TURN_PENALTY_COEF,
+        TURN_PENALTY_START,
         VEL_MAX,
         VEL_MIN,
         YAW_RATE_MAX,
@@ -73,17 +72,16 @@ except ImportError:
         OBS_DIM,
         OBS_FRENET_OFFSET,
         OBS_LOOKAHEAD_OFFSET,
-        PROGRESS_BACK_WINDOW,
-        PROGRESS_FORWARD_WINDOW,
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
-        STALL_PENALTY,
         STEER_MAX,
         STEER_MIN,
         STEER_RATE_MAX,
         SUBSTEPS,
         TERMINATION_PENALTY,
+        TURN_PENALTY_COEF,
+        TURN_PENALTY_START,
         VEL_MAX,
         VEL_MIN,
         YAW_RATE_MAX,
@@ -237,7 +235,6 @@ def advance_kernel(
     nearest_waypoint: wp.array2d(dtype=wp.int32),
     centerline: wp.array(dtype=wp.vec3),
     num_waypoints: int,
-    track_length: float,
     lookahead_stride: int,
     lidar_basis: wp.array(dtype=wp.vec2),
     seed_base: int,
@@ -245,8 +242,6 @@ def advance_kernel(
     env_id = wp.tid()
     x = cars[env_id, 0]
     y = cars[env_id, 1]
-    prev_x = x
-    prev_y = y
     steer = cars[env_id, 2]
     velocity = cars[env_id, 3]
     heading = cars[env_id, 4]
@@ -307,42 +302,26 @@ def advance_kernel(
     truncated = step_count >= MAX_EPISODE_STEPS
     step_count += 1
 
-    current_waypoint = waypoint_index
-    best_dist_sq = float(3.4028234663852886e38)
-    for offset in range(-PROGRESS_BACK_WINDOW, PROGRESS_FORWARD_WINDOW + 1):
-        candidate = waypoint_index + offset
-        if candidate < 0:
-            candidate += num_waypoints
-        elif candidate >= num_waypoints:
-            candidate -= num_waypoints
-
-        center = centerline[candidate]
-        dx_center = x - center[0]
-        dy_center = y - center[1]
-        dist_sq = dx_center * dx_center + dy_center * dy_center
-        if dist_sq < best_dist_sq:
-            best_dist_sq = dist_sq
-            current_waypoint = candidate
-
+    current_waypoint = nearest_waypoint[cell_x, cell_y]
     waypoint_delta = current_waypoint - waypoint_index
     if 2 * waypoint_delta > num_waypoints:
         waypoint_delta -= num_waypoints
     elif 2 * waypoint_delta < -num_waypoints:
         waypoint_delta += num_waypoints
-    waypoint_delta = wp.clamp(waypoint_delta, -PROGRESS_BACK_WINDOW, PROGRESS_FORWARD_WINDOW)
 
     tangent = centerline[current_waypoint][2]
     forward_speed = velocity * wp.cos(slip_angle + heading - tangent)
-    prev_tangent = centerline[waypoint_index][2]
-    step_forward_distance = (x - prev_x) * wp.cos(prev_tangent) + (y - prev_y) * wp.sin(prev_tangent)
     progress_reward = (
-        step_forward_distance
-        / track_length
+        wp.float32(waypoint_delta)
+        / wp.float32(num_waypoints)
         * PROGRESS_REWARD_SCALE
         * (1.0 + wp.max(forward_speed, 0.0) / PROGRESS_SPEED_SCALE)
     )
-    stall_cost = wp.where(step_forward_distance <= 0.0, -STALL_PENALTY, 0.0)
-    rewards[env_id] = progress_reward + stall_cost + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
+    turn_excess = wp.max(wp.abs(steer) - TURN_PENALTY_START, 0.0)
+    turn_range = wp.max(STEER_MAX - TURN_PENALTY_START, 1e-6)
+    turn_frac = turn_excess / turn_range
+    turn_penalty = -TURN_PENALTY_COEF * turn_frac * turn_frac
+    rewards[env_id] = progress_reward + turn_penalty + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
 
     if terminated:
         done_codes[env_id] = DONE_TERMINATED
@@ -518,7 +497,6 @@ class RacingEnv:
                 self.waypoint_lut,
                 self.centerline,
                 self.num_waypoints,
-                self.map.track_length,
                 self.lookahead_stride,
                 self.lidar_dirs,
                 int(launch_seed),
