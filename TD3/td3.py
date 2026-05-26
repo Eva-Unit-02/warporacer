@@ -118,11 +118,11 @@ class NStepBuilder:
         dones: torch.Tensor,
     ):
         if self.n_step > 1:
-            self.obs[:-1].copy_(self.obs[1:])
-            self.actions[:-1].copy_(self.actions[1:])
-            self.rewards[:-1].copy_(self.rewards[1:])
-            self.next_obs[:-1].copy_(self.next_obs[1:])
-            self.dones[:-1].copy_(self.dones[1:])
+            self.obs[:-1].copy_(self.obs[1:].clone())
+            self.actions[:-1].copy_(self.actions[1:].clone())
+            self.rewards[:-1].copy_(self.rewards[1:].clone())
+            self.next_obs[:-1].copy_(self.next_obs[1:].clone())
+            self.dones[:-1].copy_(self.dones[1:].clone())
 
         self.obs[-1] = obs
         self.actions[-1] = actions
