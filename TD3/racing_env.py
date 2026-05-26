@@ -32,6 +32,8 @@ try:
         OBS_DIM,
         OBS_FRENET_OFFSET,
         OBS_LOOKAHEAD_OFFSET,
+        PROGRESS_BACK_WINDOW,
+        PROGRESS_FORWARD_WINDOW,
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
@@ -70,6 +72,8 @@ except ImportError:
         OBS_DIM,
         OBS_FRENET_OFFSET,
         OBS_LOOKAHEAD_OFFSET,
+        PROGRESS_BACK_WINDOW,
+        PROGRESS_FORWARD_WINDOW,
         PROGRESS_REWARD_SCALE,
         PROGRESS_SPEED_SCALE,
         SLIP_ANGLE_MAX,
@@ -298,12 +302,29 @@ def advance_kernel(
     truncated = step_count >= MAX_EPISODE_STEPS
     step_count += 1
 
-    current_waypoint = nearest_waypoint[cell_x, cell_y]
+    current_waypoint = waypoint_index
+    best_dist_sq = float(3.4028234663852886e38)
+    for offset in range(-PROGRESS_BACK_WINDOW, PROGRESS_FORWARD_WINDOW + 1):
+        candidate = waypoint_index + offset
+        if candidate < 0:
+            candidate += num_waypoints
+        elif candidate >= num_waypoints:
+            candidate -= num_waypoints
+
+        center = centerline[candidate]
+        dx_center = x - center[0]
+        dy_center = y - center[1]
+        dist_sq = dx_center * dx_center + dy_center * dy_center
+        if dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            current_waypoint = candidate
+
     waypoint_delta = current_waypoint - waypoint_index
     if 2 * waypoint_delta > num_waypoints:
         waypoint_delta -= num_waypoints
     elif 2 * waypoint_delta < -num_waypoints:
         waypoint_delta += num_waypoints
+    waypoint_delta = wp.clamp(waypoint_delta, -PROGRESS_BACK_WINDOW, PROGRESS_FORWARD_WINDOW)
 
     tangent = centerline[current_waypoint][2]
     forward_speed = velocity * wp.cos(slip_angle + heading - tangent)
