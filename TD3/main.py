@@ -22,7 +22,7 @@ except ImportError:
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
-    iterations: int = 2000,
+    iterations: int = 4000,
     seed: int = 0,
     hidden: int = 256,
     buffer_size: int = 262_144,
@@ -30,7 +30,7 @@ def main(
     learning_starts: int = 100_000,
     n_step: int = 20,
     utd: float = 1.0,
-    gamma: float = 0.997,
+    gamma: float = 0.9965,
     tau: float = 0.005,
     actor_lr: float = 1e-4,
     critic_lr: float = 2e-4,
