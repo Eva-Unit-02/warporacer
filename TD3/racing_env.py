@@ -17,6 +17,7 @@ try:
         DONE_TERMINATED,
         DONE_TRUNCATED,
         DRIFT_FRACTION,
+        DT,
         DT_HALF_SUBSTEP,
         DT_SIXTH_SUBSTEP,
         DT_SUBSTEP,
@@ -41,6 +42,7 @@ try:
         SUBSTEPS,
         TERMINATION_PENALTY,
         TURN_PENALTY_COEF,
+        TURN_PENALTY_HOLD_SECONDS,
         TURN_PENALTY_START,
         VEL_MAX,
         VEL_MIN,
@@ -57,6 +59,7 @@ except ImportError:
         DONE_TERMINATED,
         DONE_TRUNCATED,
         DRIFT_FRACTION,
+        DT,
         DT_HALF_SUBSTEP,
         DT_SIXTH_SUBSTEP,
         DT_SUBSTEP,
@@ -81,6 +84,7 @@ except ImportError:
         SUBSTEPS,
         TERMINATION_PENALTY,
         TURN_PENALTY_COEF,
+        TURN_PENALTY_HOLD_SECONDS,
         TURN_PENALTY_START,
         VEL_MAX,
         VEL_MIN,
@@ -228,6 +232,7 @@ def advance_kernel(
     done_codes: wp.array(dtype=wp.int32),
     cars: wp.array2d(dtype=wp.float32),
     car_meta: wp.array2d(dtype=wp.int32),
+    turn_hold_times: wp.array(dtype=wp.float32),
     domain_randomization: wp.array2d(dtype=wp.float32),
     map_origin: wp.vec2,
     map_resolution: float,
@@ -249,6 +254,7 @@ def advance_kernel(
     slip_angle = cars[env_id, 6]
     step_count = car_meta[env_id, 0]
     waypoint_index = car_meta[env_id, 1]
+    turn_hold_time = turn_hold_times[env_id]
 
     mu_scale = domain_randomization[env_id, 0]
     mass_scale = domain_randomization[env_id, 1]
@@ -320,7 +326,12 @@ def advance_kernel(
     turn_excess = wp.max(wp.abs(steer) - TURN_PENALTY_START, 0.0)
     turn_range = wp.max(STEER_MAX - TURN_PENALTY_START, 1e-6)
     turn_frac = turn_excess / turn_range
-    turn_penalty = -TURN_PENALTY_COEF * turn_frac * turn_frac
+    turn_hold_time = wp.where(turn_excess > 0.0, turn_hold_time + DT, 0.0)
+    turn_penalty = wp.where(
+        turn_hold_time > TURN_PENALTY_HOLD_SECONDS,
+        -TURN_PENALTY_COEF * turn_frac * turn_frac,
+        0.0,
+    )
     rewards[env_id] = progress_reward + turn_penalty + wp.where(terminated, -TERMINATION_PENALTY, 0.0)
 
     if terminated:
@@ -341,6 +352,7 @@ def advance_kernel(
         velocity = 0.0
         yaw_rate = 0.0
         slip_angle = 0.0
+        turn_hold_time = 0.0
         step_count = 0
         current_waypoint = reset_index
         domain_randomization[env_id, 0] = 1.0 - DRIFT_FRACTION + 2.0 * DRIFT_FRACTION * wp.randf(rng)
@@ -417,6 +429,7 @@ def advance_kernel(
     cars[env_id, 6] = slip_angle
     car_meta[env_id, 0] = step_count
     car_meta[env_id, 1] = current_waypoint
+    turn_hold_times[env_id] = turn_hold_time
 
 
 class RacingEnv:
@@ -454,6 +467,7 @@ class RacingEnv:
 
         self.car_state = wp.array(car_state, dtype=float, device=wp_device)
         self.car_meta = wp.array(car_meta, dtype=int, device=wp_device)
+        self.turn_hold_times = wp.zeros(num_envs, dtype=float, device=wp_device)
         self.randomized_params = wp.array(randomized, dtype=float, device=wp_device)
         self.observations = wp.zeros((num_envs, OBS_DIM), dtype=float, device=wp_device)
         self.rewards = wp.zeros(num_envs, dtype=float, device=wp_device)
@@ -464,6 +478,7 @@ class RacingEnv:
         self.done_torch = wp.to_torch(self.done_codes)
         self.car_state_torch = wp.to_torch(self.car_state)
         self.car_meta_torch = wp.to_torch(self.car_meta)
+        self.turn_hold_torch = wp.to_torch(self.turn_hold_times)
         self._step_counts = self.car_meta_torch[:, 0]
 
         lidar_angles = np.linspace(-LIDAR_FOV * 0.5, LIDAR_FOV * 0.5, NUM_LIDAR, dtype=np.float32)
@@ -490,6 +505,7 @@ class RacingEnv:
                 self.done_codes,
                 self.car_state,
                 self.car_meta,
+                self.turn_hold_times,
                 self.randomized_params,
                 wp.vec2(self.map.origin_x, self.map.origin_y),
                 self.map.resolution,
@@ -520,6 +536,7 @@ class RacingEnv:
         self._launch(self._zero_actions)
         self._sanitize_buffers()
         self._step_counts.zero_()
+        self.turn_hold_torch.zero_()
         self.rew_torch.zero_()
         self.done_torch.zero_()
         return self.obs_torch, {}
@@ -543,6 +560,7 @@ class RacingEnv:
             "observations": self.obs_torch.clone(),
             "rewards": self.rew_torch.clone(),
             "done_codes": self.done_torch.clone(),
+            "turn_hold_times": self.turn_hold_torch.clone(),
             "randomized_params": wp.to_torch(self.randomized_params).clone(),
             "launch_count": self._launch_count,
         }
@@ -554,5 +572,6 @@ class RacingEnv:
         self.obs_torch.copy_(snapshot["observations"])
         self.rew_torch.copy_(snapshot["rewards"])
         self.done_torch.copy_(snapshot["done_codes"])
+        self.turn_hold_torch.copy_(snapshot["turn_hold_times"])
         wp.to_torch(self.randomized_params).copy_(snapshot["randomized_params"])
         self._launch_count = snapshot["launch_count"]
