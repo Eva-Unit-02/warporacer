@@ -30,7 +30,7 @@ def main(
     learning_starts: int = 100_000,
     n_step: int = 20,
     utd: float = 1.0,
-    gamma: float = 0.996,
+    gamma: float = 0.997,
     tau: float = 0.005,
     actor_lr: float = 1e-4,
     critic_lr: float = 2e-4,
