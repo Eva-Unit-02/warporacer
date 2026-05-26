@@ -25,7 +25,7 @@ def main(
     iterations: int = 2000,
     seed: int = 0,
     hidden: int = 256,
-    buffer_size: int = 262_144,
+    buffer_size: int = 262_144 * 2,
     batch_size: int = 1024,
     learning_starts: int = 100_000,
     utd: float = 1.0,
