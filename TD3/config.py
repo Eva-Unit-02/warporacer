@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import numpy as np
+
+
+# Vehicle model
+MU = 1.0489
+C_SF = 4.718
+C_SR = 5.4562
+LF = 0.15875
+LR = 0.17145
+WHEELBASE = LF + LR
+H_CG = 0.074
+MASS = 3.74
+I_Z = 0.04712
+
+# Action and state limits
+STEER_MIN = -0.4189
+STEER_MAX = 0.4189
+STEER_RATE_MAX = 3.2
+V_SWITCH = 2.0
+V_BLEND_WIDTH = 1.0
+V_BLEND_MIN = 1.0
+ACCEL_MAX = 9.51
+VEL_MIN = -5.0
+VEL_MAX = 20.0
+YAW_RATE_MAX = 6.0
+SLIP_ANGLE_MAX = 1.2
+
+# Geometry and integration
+CAR_WIDTH = 0.31
+CAR_LENGTH = 0.58
+CAR_HALF_DIAG = float(np.hypot(CAR_WIDTH * 0.5, CAR_LENGTH * 0.5))
+GRAVITY = 9.81
+DT = 1.0 / 60.0
+SUBSTEPS = 6
+DT_SUBSTEP = DT / float(SUBSTEPS)
+DT_HALF_SUBSTEP = DT_SUBSTEP * 0.5
+DT_SIXTH_SUBSTEP = DT_SUBSTEP / 6.0
+
+# Domain randomization
+DRIFT_FRACTION = 0.15
+
+# Reward shaping
+PROGRESS_REWARD_SCALE = 100.0
+PROGRESS_SPEED_SCALE = 10.0
+TERMINATION_PENALTY = 10.0
+
+# Observation layout
+NUM_LIDAR = 108
+LIDAR_FOV = np.radians(270.0)
+LIDAR_RANGE = 20.0
+NUM_LOOKAHEAD = 10
+OBS_FRENET_OFFSET = 3 + NUM_LIDAR
+OBS_LOOKAHEAD_OFFSET = OBS_FRENET_OFFSET + 2
+OBS_DIM = OBS_LOOKAHEAD_OFFSET + 2 * NUM_LOOKAHEAD
+ACT_DIM = 2
+MAX_EPISODE_STEPS = 10_000
+
+# Map processing
+OCCUPANCY_THRESHOLD = 230
+SMOOTHING_WINDOW = 51
+NEIGHBOR_OFFSETS = (
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
+
+# Internal termination encoding
+DONE_TERMINATED = 1
+DONE_TRUNCATED = 2
