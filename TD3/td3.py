@@ -443,7 +443,16 @@ def train(
             video_path = log_dir / f"rollout_iter{iteration + 1:06d}.mp4"
             try:
                 record_rollout(env, agent, record_steps, video_path, obs_rms=obs_rms)
-                wandb.log({"rollout": wandb.Video(str(video_path), format="mp4")}, step=env_steps)
+                wandb.log(
+                    {
+                        "rollout": wandb.Video(str(video_path), format="mp4"),
+                        f"rollouts/iter_{iteration + 1:06d}": wandb.Video(
+                            str(video_path),
+                            format="mp4",
+                        ),
+                    },
+                    step=env_steps,
+                )
             except Exception as exc:
                 print(f"[rollout {iteration + 1}] failed: {exc}")
 
