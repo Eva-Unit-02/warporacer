@@ -28,7 +28,7 @@ def main(
     buffer_size: int = 262_144,
     batch_size: int = 1024,
     learning_starts: int = 100_000,
-    n_step: int = 15,
+    n_step: int = 5,
     utd: float = 1.0,
     gamma: float = 0.99,
     tau: float = 0.005,
