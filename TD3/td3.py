@@ -265,6 +265,7 @@ def train(
     log_dir: Path = Path("./logs_td3"),
     record_every: int = 250,
     record_steps: int = 1800,
+    record_env=None,
 ):
     device = next(agent.parameters()).device
     num_envs = env.num_envs
@@ -442,7 +443,8 @@ def train(
         if record_every > 0 and (iteration + 1) % record_every == 0:
             video_path = log_dir / f"rollout_iter{iteration + 1:06d}.mp4"
             try:
-                record_rollout(env, agent, record_steps, video_path, obs_rms=obs_rms)
+                rollout_env = env if record_env is None else record_env
+                record_rollout(rollout_env, agent, record_steps, video_path, obs_rms=obs_rms)
                 wandb.log({"rollout": wandb.Video(str(video_path), format="mp4")}, step=env_steps)
             except Exception as exc:
                 print(f"[rollout {iteration + 1}] failed: {exc}")

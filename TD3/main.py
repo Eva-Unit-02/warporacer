@@ -10,17 +10,68 @@ from typer import run
 try:
     from .agent import TD3Agent
     from .config import ACT_DIM, OBS_DIM
+    from .multi_map_env import MultiMapRacingEnv
     from .racing_env import RacingEnv
     from .td3 import record_rollout, train
 except ImportError:
     from agent import TD3Agent
     from config import ACT_DIM, OBS_DIM
+    from multi_map_env import MultiMapRacingEnv
     from racing_env import RacingEnv
     from td3 import record_rollout, train
 
 
+def _build_training_env(map_yamls: list[Path], num_envs: int, seed: int, device: str):
+    if len(map_yamls) == 1:
+        return RacingEnv(
+            map_yamls[0],
+            num_envs=num_envs,
+            seed=seed,
+            device=device or None,
+        )
+
+    return MultiMapRacingEnv(
+        map_yamls,
+        num_envs=num_envs,
+        seed=seed,
+        device=device or None,
+    )
+
+
+def _record_all_maps(
+    maps_dir: Path,
+    log_dir: Path,
+    agent: TD3Agent,
+    obs_rms,
+    record_steps: int,
+    seed: int,
+    device: str,
+    env_steps: int,
+):
+    eval_maps = sorted(maps_dir.glob("*.yaml"))
+    eval_dir = log_dir / "rollouts_all_maps"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, eval_map in enumerate(eval_maps):
+        eval_env = RacingEnv(
+            eval_map,
+            num_envs=1,
+            seed=seed + 100_000 + idx,
+            device=device,
+        )
+        video_path = eval_dir / f"{eval_map.stem}.mp4"
+        record_rollout(eval_env, agent, record_steps, video_path, obs_rms=obs_rms)
+        try:
+            wandb.log(
+                {f"rollout_{eval_map.stem}": wandb.Video(str(video_path), format="mp4")},
+                step=env_steps,
+            )
+        except Exception:
+            pass
+
+
 def main(
-    map_yaml: Path,
+    map_yamls: list[Path],
     num_envs: int = 4096,
     iterations: int = 16000,
     seed: int = 0,
@@ -45,6 +96,11 @@ def main(
     use_wandb: bool = True,
     wandb_project: str = "warporacer",
 ):
+    if not map_yamls:
+        raise ValueError("Provide at least one map yaml")
+
+    map_yamls = [Path(path) for path in map_yamls]
+    train_map_names = [str(path) for path in map_yamls]
     log_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(seed)
@@ -54,12 +110,8 @@ def main(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    env = RacingEnv(
-        map_yaml,
-        num_envs=num_envs,
-        seed=seed,
-        device=device or None,
-    )
+    env = _build_training_env(map_yamls, num_envs=num_envs, seed=seed, device=device)
+    rollout_env = env if isinstance(env, RacingEnv) else env.envs[0]
     agent = TD3Agent(obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=hidden).to(env.device)
 
     if use_wandb:
@@ -69,7 +121,7 @@ def main(
                 name=f"td3_seed{seed}_n{num_envs}",
                 config={
                     "algorithm": "TD3",
-                    "map": str(map_yaml),
+                    "maps": train_map_names,
                     "seed": seed,
                     "num_envs": num_envs,
                     "iterations": iterations,
@@ -113,6 +165,7 @@ def main(
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
+        record_env=rollout_env,
     )
     print(
         f"[done] {elapsed:.1f}s env_steps={env_steps} "
@@ -122,6 +175,7 @@ def main(
     checkpoint = {
         "agent": agent.state_dict(),
         "target": target.state_dict(),
+        "train_maps": train_map_names,
         "obs_mean": obs_rms.mean.cpu(),
         "obs_var": obs_rms.var.cpu(),
         "obs_count": obs_rms.count,
@@ -131,12 +185,17 @@ def main(
     }
     torch.save(checkpoint, log_dir / "agent_final.pt")
 
-    final_video = log_dir / "rollout_final.mp4"
-    record_rollout(env, agent, record_steps, final_video, obs_rms=obs_rms)
-    try:
-        wandb.log({"rollout_final": wandb.Video(str(final_video), format="mp4")}, step=env_steps)
-    except Exception:
-        pass
+    maps_dir = Path(__file__).resolve().parent.parent / "maps"
+    _record_all_maps(
+        maps_dir=maps_dir,
+        log_dir=log_dir,
+        agent=agent,
+        obs_rms=obs_rms,
+        record_steps=record_steps,
+        seed=seed,
+        device=env.device,
+        env_steps=env_steps,
+    )
 
 
 if __name__ == "__main__":
