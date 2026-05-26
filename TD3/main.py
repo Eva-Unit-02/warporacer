@@ -12,13 +12,13 @@ try:
     from .config import ACT_DIM, OBS_DIM
     from .multi_map_env import MultiMapRacingEnv
     from .racing_env import RacingEnv
-    from .td3 import record_rollout, train
+    from .td3 import RunningStats, record_rollout, train
 except ImportError:
     from agent import TD3Agent
     from config import ACT_DIM, OBS_DIM
     from multi_map_env import MultiMapRacingEnv
     from racing_env import RacingEnv
-    from td3 import record_rollout, train
+    from td3 import RunningStats, record_rollout, train
 
 
 def _build_training_env(map_yamls: list[Path], num_envs: int, seed: int, device: str):
@@ -51,16 +51,24 @@ def _record_all_maps(
     eval_maps = sorted(maps_dir.glob("*.yaml"))
     eval_dir = log_dir / "rollouts_all_maps"
     eval_dir.mkdir(parents=True, exist_ok=True)
+    skipped: list[str] = []
 
     for idx, eval_map in enumerate(eval_maps):
-        eval_env = RacingEnv(
-            eval_map,
-            num_envs=1,
-            seed=seed + 100_000 + idx,
-            device=device,
-        )
-        video_path = eval_dir / f"{eval_map.stem}.mp4"
-        record_rollout(eval_env, agent, record_steps, video_path, obs_rms=obs_rms)
+        try:
+            eval_env = RacingEnv(
+                eval_map,
+                num_envs=1,
+                seed=seed + 100_000 + idx,
+                device=device,
+            )
+            video_path = eval_dir / f"{eval_map.stem}.mp4"
+            record_rollout(eval_env, agent, record_steps, video_path, obs_rms=obs_rms)
+        except Exception as exc:
+            message = f"{eval_map}: {type(exc).__name__}: {exc}"
+            skipped.append(message)
+            print(f"[rollout skip] {message}")
+            continue
+
         try:
             wandb.log(
                 {f"rollout_{eval_map.stem}": wandb.Video(str(video_path), format="mp4")},
@@ -68,6 +76,21 @@ def _record_all_maps(
             )
         except Exception:
             pass
+
+    if skipped:
+        (eval_dir / "skipped_maps.txt").write_text("\n".join(skipped) + "\n")
+
+
+def _load_checkpoint(checkpoint_path: Path, agent: TD3Agent, device: str):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    agent.load_state_dict(checkpoint["agent"])
+
+    obs_rms = RunningStats((OBS_DIM,), device)
+    obs_rms.mean.copy_(checkpoint["obs_mean"].to(device))
+    obs_rms.var.copy_(checkpoint["obs_var"].to(device))
+    obs_rms.count = checkpoint["obs_count"]
+    obs_rms.inv_std = torch.rsqrt(obs_rms.var + 1e-8)
+    return checkpoint, obs_rms
 
 
 def main(
@@ -81,7 +104,7 @@ def main(
     learning_starts: int = 100_000,
     n_step: int = 20,
     utd: float = 1.0,
-    gamma: float = 0.9965,
+    gamma: float = 0.9963,
     tau: float = 0.005,
     actor_lr: float = 1e-4,
     critic_lr: float = 2e-4,
@@ -95,6 +118,7 @@ def main(
     record_steps: int = 1800,
     use_wandb: bool = True,
     wandb_project: str = "warporacer",
+    checkpoint: Path | None = None,
 ):
     if not map_yamls:
         raise ValueError("Provide at least one map yaml")
@@ -109,6 +133,24 @@ def main(
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    if checkpoint is not None:
+        run_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        agent = TD3Agent(obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=hidden).to(run_device)
+        loaded_checkpoint, obs_rms = _load_checkpoint(checkpoint, agent, run_device)
+        env_steps = int(loaded_checkpoint.get("env_steps", 0))
+        maps_dir = Path(__file__).resolve().parent.parent / "maps"
+        _record_all_maps(
+            maps_dir=maps_dir,
+            log_dir=log_dir,
+            agent=agent,
+            obs_rms=obs_rms,
+            record_steps=record_steps,
+            seed=seed,
+            device=run_device,
+            env_steps=env_steps,
+        )
+        return
 
     env = _build_training_env(map_yamls, num_envs=num_envs, seed=seed, device=device)
     rollout_env = env if isinstance(env, RacingEnv) else env.envs[0]
